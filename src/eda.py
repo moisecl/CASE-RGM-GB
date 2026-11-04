@@ -329,6 +329,13 @@ COMENTÁRIOS:
 - As relações receita = qt_vendida * preco_medio permitem recuperar um campo ausente
 quando os outros dois estão disponíveis e válidos. Caso dois desses campos estejam ausentes (diferente de 0) 
 assumiu-se como linha não válida para uso
+- A EDA encontrou linhas sem receita e sem quantidade vendida: sem nenhum dos dois
+  valores não é possível determinar a demanda nem recuperar a receita, então essas
+  linhas são removidas.
+- Quando qt_vendida é zero e receita está ausente, o registro indica ausência de
+  venda; preencher receita com zero preserva essa observação sem inventar demanda.
+- Preço ausente em registros com quantidade e receita iguais a zero é compatível
+  com ausência de venda: sem transação não há preço observado.
 - Para a subcategoria também pode ser preenchida quando SKU, categoria e canal 
 apontam para uma única subcategoria.
 - Mantemos qt_ruptura ausente porque ausência não significa zero. 
@@ -337,6 +344,27 @@ mediana avaliando SKU-Canal para linhas com Receita > 0, visto que desconto sem 
 """
 
 # Aplicar correções
+casos_receita_quantidade = pd.Series(
+    {
+        'receita e qt_vendida ausentes': int(
+            (df['receita'].isna() & df['qt_vendida'].isna()).sum()
+        ),
+        'receita ausente com qt_vendida igual a zero': int(
+            (df['receita'].isna() & df['qt_vendida'].eq(0)).sum()
+        ),
+        'preço ausente com receita e qt_vendida iguais a zero': int(
+            (
+                df['preco_medio'].isna()
+                & df['receita'].eq(0)
+                & df['qt_vendida'].eq(0)
+            ).sum()
+        ),
+    },
+    name='quantidade de linhas',
+)
+print('\n--- DIAGNÓSTICO DOS CASOS DE RECEITA, QUANTIDADE E PREÇO ---')
+print(casos_receita_quantidade)
+
 missing_antes = df.isna().sum()
 subcategorias_antes = df['subcategoria_id'].isna().sum()
 df = preparar_valores_ausentes_vendas(df)

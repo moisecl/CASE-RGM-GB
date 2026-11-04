@@ -34,6 +34,8 @@ permitem obter o valor pela relação `receita = quantidade × preço`. Preço �
 recalculado quando quantidade positiva e receita estão disponíveis; demais
 ausências e outliers são preenchidos pela mediana do SKU. Subcategoria é
 preenchida apenas quando SKU, categoria e canal têm mapeamento observado único.
+Linhas sem quantidade vendida e sem receita são removidas; quando a quantidade
+vendida é zero e a receita está ausente, a receita é definida como zero.
 Margem e desconto são imputados pela mediana do SKU-canal, usando como referência
 registros com receita positiva; descontos acima de 100% são tratados como
 inválidos antes da imputação. Valores negativos de ruptura são limitados a zero,
@@ -59,4 +61,4 @@ python src\pipeline.py
 `pipeline.py` executa o resumo de elasticidade e o modelo. Use `model.py` para
 treinar e avaliar somente o modelo. A EDA gera os gráficos em `outputs/eda/`.
 O modelo exclui os registros anteriores a 2025-01-01 antes de criar os atributos
-temporais, pois 2024 tem apenas onze semanas observadas e possui comportamento atípico de demanda por SKU quando comapardao a demanda de 2025 a 2026.
+temporais, pois 2024 tem apenas onze semanas observadas e possui comportamento atípico de demanda por SKU quando comparado à demanda de 2025 a 2026.

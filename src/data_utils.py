@@ -105,17 +105,18 @@ def remover_duplicatas_vendas(
 
 
 def preparar_valores_ausentes_vendas(df: pd.DataFrame) -> pd.DataFrame:
-    """Aplica as regras exploradas para corrigir valores e imputar ausências.
-
-    Converte quantidade negativa em valor absoluto para qt_vendida, recalcula
-    preços acima de cinco vezes a mediana do SKU usando receita / quantidade
+    """Aplica as regras com base na análise exploratória para corrigir valores e imputar ausências.
+    1. Converte quantidade negativa em valor absoluto para qt_vendida, 
+    2. Define receita como zero quando qt_vendida é zero e receita está ausente, 
+    3. Remove linhas sem receita e sem quantidade vendida, 
+    4. Recalcula preços acima de cinco vezes a mediana do SKU usando receita / quantidade
     quando o preço calculado é positivo e permanece dentro desse limite,
-    recalcula quantidade/receita/preço quando um dos três campos está ausente, e preenche
-    subcategoria apenas quando o mapeamento SKU-categoria-canal é único.
-    Imputa margem e desconto pela mediana SKU-canal entre registros com receita
-    positiva; descontos acima de 100% são tratados como inválidos. Preço ainda
-    ausente após as recuperações recebe a mediana do SKU. Valores negativos de
-    ruptura são limitados a zero, mas ausências de ruptura são preservadas.
+    5. Recalcula quantidade/receita/preço quando um dos três campos está ausente 
+    Preenche a subcategoria apenas quando o mapeamento SKU-categoria-canal é único.
+    6. Imputa margem e desconto pela mediana SKU-canal entre registros com receita
+    positiva
+    7. Descontos acima de 100% são tratados como inválidos. Preço ainda
+    ausente após as tratamenos recebe a mediana do SKU.
 
     Args:
         df: Dados já deduplicados e com a data normalizada.
@@ -127,7 +128,11 @@ def preparar_valores_ausentes_vendas(df: pd.DataFrame) -> pd.DataFrame:
     if "qt_vendida_raw" not in df.columns:
         df["qt_vendida_raw"] = df["qt_vendida"]
     df["qt_vendida"] = df["qt_vendida"].abs()
-    df["qt_ruptura"] = df["qt_ruptura"].clip(lower=0)
+    no_sales_missing_revenue = (
+        df["qt_vendida"].eq(0) & df["receita"].isna()
+    )
+    df.loc[no_sales_missing_revenue, "receita"] = 0
+    df = df.dropna(subset=["qt_vendida", "receita"]).copy()
 
     median_price = df.groupby("sku_id")["preco_medio"].transform("median")
     price_upper_limit = 5 * median_price
@@ -209,7 +214,7 @@ def preparar_dados_modelo(dados_brutos: pd.DataFrame) -> pd.DataFrame:
     demanda real, calendário e atributos históricos (lags e janelas móveis).
     Descarta observações anteriores a 2025 antes de criar atributos temporais,
     pois 2024 tem cobertura parcial e comportamento não comparável à série
-    observada de 2025–2026.
+    observada de 2025 e 2026.
 
     Args:
         dados_brutos: Dados de vendas carregados do CSV.
@@ -296,3 +301,12 @@ def preparar_dados_modelo(dados_brutos: pd.DataFrame) -> pd.DataFrame:
     df["dez"] = (df["mes"] == 12).astype(int)
     df["tendencia"] = (df["semana"] - df["semana"].min()).dt.days / 7.0
     return df
+
+## Opcional: Executa para verificar se o carregamento e preparação funcionam corretamente e exibe o DataFrame resultante usado no modelo. 
+# Remova ou comente esta parte se não for necessária.
+"""""
+dados = carregar_dados_vendas()
+df_modelo = preparar_dados_modelo(dados)
+display(df_modelo)
+
+"""""
