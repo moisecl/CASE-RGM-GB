@@ -7,9 +7,9 @@ import shap
 from sklearn.metrics import mean_absolute_error
 
 if __package__:
-    from .data_utils import load_sales_data, prepare_model_data
+    from .data_utils import carregar_dados_vendas, preparar_dados_modelo
 else:
-    from data_utils import load_sales_data, prepare_model_data
+    from data_utils import carregar_dados_vendas, preparar_dados_modelo
 
 
 CUTOFF = pd.Timestamp("2026-04-30")
@@ -172,7 +172,7 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
 
 
 def main() -> None:
-    df = prepare_model_data(load_sales_data())
+    df = preparar_dados_modelo(carregar_dados_vendas())
     run_model(df)
 
 

@@ -5,10 +5,10 @@ import pandas as pd
 import statsmodels.formula.api as smf
 
 if __package__:
-    from .data_utils import load_sales_data, prepare_model_data
+    from .data_utils import carregar_dados_vendas, preparar_dados_modelo
     from .model import run_model
 else:
-    from data_utils import load_sales_data, prepare_model_data
+    from data_utils import carregar_dados_vendas, preparar_dados_modelo
     from model import run_model
 
 
@@ -37,7 +37,7 @@ def elasticidade_por_sku(group: pd.DataFrame) -> pd.Series:
 
 
 def main() -> None:
-    df = prepare_model_data(load_sales_data())
+    df = preparar_dados_modelo(carregar_dados_vendas())
     print(
         df.groupby("canal")[
             ["demanda_real", "preco_medio", "desconto_pct"]
