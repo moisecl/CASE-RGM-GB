@@ -1,8 +1,8 @@
-lightgbm
-matplotlib
-numpy
-pandas
-scikit-learn
-seaborn
-shap
-statsmodels
+lightgbm==4.7.0
+matplotlib==3.10.8
+numpy==2.4.2
+pandas==3.0.1
+scikit-learn==1.9.1
+seaborn==0.13.2
+shap==0.54.1
+statsmodels==0.15.0
