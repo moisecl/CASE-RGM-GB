@@ -7,7 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 if __package__:
-    from data_utils import (
+    from src.data_utils import (
         EDA_OUTPUT_DIR,
         NUMERIC_COLUMNS,
         carregar_dados_vendas,
@@ -15,7 +15,7 @@ if __package__:
         remover_duplicatas_vendas,
     )
 else:
-    from data_utils import (
+    from src.data_utils import (
         EDA_OUTPUT_DIR,
         NUMERIC_COLUMNS,
         carregar_dados_vendas,
@@ -798,7 +798,7 @@ mecânica apropriada para cada SKU.
 """
 
 #-------------------------------------------------------------------------------#
-# Qual é a forma da relação preço–demanda por SKU? Ela é compatível com uma elasticidade estável?
+# Como se distribuem preço e venda em escala log por SKU?
 
 # Scatter log-log por SKU, todos os canais, restrito a semanas SEM ruptura
 todos_canais_ok = df[
@@ -824,88 +824,22 @@ for ax, sku in zip(axes.flat, skus):
     )
     ax.set_title(sku, fontsize=10)
     ax.set_xlabel(''); ax.set_ylabel('')
+fig.supxlabel('Log do preço médio')
+fig.supylabel('Log da quantidade vendida (un.)')
 plt.suptitle(
     'Relação preço–venda em escala log — todos os canais, semanas sem ruptura',
     y=1.02,
     fontweight='bold',
 )
-plt.tight_layout()
+plt.tight_layout(rect=[0.04, 0.04, 1, 0.96])
 save_show(fig, '14_loglog_elasticidade')
 
 """
-Interpretação: cada ponto é uma semana elegível do SKU e a linha é uma
-associação linear simples entre log(preço) e log(venda). A inclinação visual é
-apenas exploratória; a estimativa reportada abaixo controla mecânicas promocionais
-e mês, e sua incerteza é indicada pelo p-valor.
-"""
-
-## Estimativa com controle (mecânica + mês) — para evitar viés de variável omitida
-import statsmodels.formula.api as smf
-
-def elast_sku(d):
-    d = d[(d['qt_ruptura'] == 0) & (d['qt_vendida'] > 0) & (d['preco_medio'] > 0)].copy()
-    if len(d) < 20:
-        return pd.Series({'elast': np.nan, 'pval': np.nan, 'n': len(d)})
-    d['ln_q'] = np.log(d['qt_vendida']); d['ln_p'] = np.log(d['preco_medio'])
-    try:
-        m = smf.ols('ln_q ~ ln_p + flag_desconto_direto + flag_combo + flag_pague_e_leve + C(mes)',
-                    data=d).fit()
-        return pd.Series({'elast': m.params['ln_p'], 'pval': m.pvalues['ln_p'], 'n': len(d)})
-    except Exception:
-        return pd.Series({'elast': np.nan, 'pval': np.nan, 'n': len(d)})
-
-elast = df.groupby(['sku_id','canal']).apply(elast_sku).reset_index().sort_values('elast')
-print('\n--- ELASTICIDADE POR SKU × CANAL (controle: mecânica + mês; só semanas sem ruptura) ---')
-print(elast.round(3))
-
-"""
-Como interpretar elasticidade: o modelo estima
-ln(qt_vendida) = constante + β·ln(preco_medio) + controles.
-Como preço e quantidade estão em logaritmo, β é uma elasticidade: um aumento
-de 1% no preço está associado, aproximadamente, a uma variação de β% na venda,
-mantidas constantes as flags de promoção e o mês. Por exemplo, β = -1,2
-corresponde a cerca de 1,2% menos unidades para 1% mais preço. Um β negativo
-indica relação inversa; |β| > 1 é chamada elástica e |β| < 1, inelástica.
-
-A amostra exclui semanas com ruptura, vendas não positivas e preços não
-positivos; também exige ao menos 20 observações por SKU-canal. C(mes) controla
-diferenças médias entre meses e as flags controlam mecânicas observadas. O
-p-valor testa a hipótese β = 0, mas não mede tamanho do efeito nem garante
-causalidade: fatores não observados e decisões promocionais podem confundir a
-associação. A estimativa é específica para cada SKU-canal e não deve ser
-generalizada automaticamente para outros períodos ou produtos.
-"""
-
-## Visual: elasticidade e significância
-fig, ax = plt.subplots(figsize=(14, 6))
-elast_plot = elast.dropna(subset=['elast']).copy()
-elast_plot['sig'] = np.where(elast_plot['pval'] < 0.05, 'significativa (p<0,05)', 'não significativa')
-sns.scatterplot(
-    data=elast_plot,
-    x='elast',
-    y='sku_id',
-    hue='canal',
-    style='sig',
-    s=95,
-    ax=ax,
-    palette=['#3f7180', '#c66b4e'],
-)
-ax.axvline(0, color='#514d46', linewidth=1, linestyle='--')
-ax.set_title('Sensibilidade estimada da venda ao preço')
-ax.set_xlabel('Elasticidade-preço estimada (β)')
-ax.set_ylabel('')
-ax.spines[['top', 'right', 'left']].set_visible(False)
-ax.grid(axis='y', visible=False)
-ax.grid(axis='x', alpha=0.5)
-ax.legend(title='Canal / evidência estatística', frameon=False, bbox_to_anchor=(1.02, 1), loc='upper left')
-plt.tight_layout()
-save_show(fig, '15_elasticidade_sku_canal')
-
-"""
-Interpretação: pontos à esquerda de zero indicam associação negativa entre
-preço e unidades vendidas; quanto mais distante de zero, maior a sensibilidade
-estimada. A forma do marcador diferencia p < 0,05, mas significância não prova
-causalidade. Compare SKU e canal juntos e considere o número de observações.
+COMENTÁRIO: A reta é um ajuste linear simples em escala log-log, incluído como
+referência visual. Os Desvios sistemáticos dos pontos em relação à reta sugeream uma relação não-linear
+o que indica uma elasticidade que não é constante para os SKUs analisados no período
+Para uma estimativa de elasticidade para ajudar a entnder a relação preço-demanda, modelos mais robustos e um
+estudo mais apronfudado seria necessário e dessa forma não faz parte do escopo desta análise
 """
 
 #-------------------------------------------------------------------------------#
@@ -937,14 +871,22 @@ for subcat, g in df.groupby('subcategoria_id'):
         linecolor=COR_FUNDO,
         cbar_kws={'label': 'Correlação de Pearson'},
     )
-    ax.set_title(f'SKUs com demanda que se move em conjunto — {subcat}')
+    ax.set_title(f'Correlação de Demanda entre SKUs — {subcat}')
     save_show(fig, f'16_corr_skus_{subcat}')
 
 """
-Interpretação: correlação positiva indica semanas em que as demandas tendem a
+COMENTÁRIO: correlação positiva indica semanas em que as demandas entre os SKUs tendem a
 subir ou cair juntas; correlação negativa indica movimentos opostos. Isso não
 estabelece canibalização nem efeito de promoção, pois calendário e fatores
 comuns podem explicar a associação.
+De todo modo, no histórico avaliado:
+CAT_A_SUB1: SKU_08 e SKU_04 mostraram razoaveis movimentos opostos, um aprofundamento
+poderia validar possível efeito de canibalização, assim como observado em CAT_A_SUB2 
+para os SKUs 12 e 05
+Entre todas as Subcategorias, a CAT_A SUB3 foi a que mostrou mais indícios de possível canibalização
+para os SKUS 14 e 17 (R Pearson = -0.44). Analogamente, os SKUs 15 e 11 da CAT_C_SUB1 
+tiveram a maior correlação positiva (0,80). Possivelmente, SKUs de uso complementar pelo consumidor
+
 """
 
 #-------------------------------------------------------------------------------#
@@ -983,10 +925,12 @@ plt.tight_layout()
 save_show(fig, '17_canal_comparacao')
 
 """
-Interpretação: os painéis comparam medianas e dispersões entre canais, com
-escalas próprias para cada variável. Os pontos extremos foram ocultados para
-priorizar a distribuição central; isso não significa que tenham sido removidos
-dos dados. Diferenças entre canais são descritivas, não efeitos causais.
+COMENTÁRIO: As estatística descritivas e a analise visual das distribuições de 
+Demanda, Descono e Preço Médio mostram que existe uma politica de preço rigorosa entre canais visto que
+a distribuição é quase idêntica. No período avaliado, a demanda semanal e levemente mais acentuada e com maior dispersão no canal Loja, 
+bem como a aplicação de Desconto. Talvez isso indique uma tentativa de atrair o cliente para a experiência de Loja e não só como uma venda transacional 
+OBS: Os pontos extremos foram ocultados para priorizar a distribuição central;
+isso não significa que tenham sido removidos dos dados.
 """
 
 #-------------------------------------------------------------------------------#
@@ -1007,12 +951,15 @@ ax.spines[['top', 'right']].set_visible(False)
 save_show(fig, '18_margem_por_sku')
 
 """
-Interpretação: caixas estreitas indicam menor variação central da margem dentro
-do SKU; caixas largas indicam maior heterogeneidade. A comparação ajuda a
-identificar produtos para investigação, mas não explica por si só as causas.
+COMENTÁRIO: De forma geral, a variação da margem para os SKUs e relativamente pequena, 
+o maior range foi SKU 04 com variação de 3,76 p.p, enquanto o SKU_02 com 1,4p.p foi o menor.
+Entretando, quando avaliamos a margem entre SKUs, o SKU 04 trabalha com margens entre 26 e 30%, a menor entre todos os 
+SKUs, bem distante da margem praticada pelo TOP SKU, SKU 01, e o SKU 11 com margens entre 57 e 61%.
 """
 
 #-------------------------------------------------------------------------------#
+######### Exlcuir da análise e do modelo #################
+
 # Existem semanas com demanda_real = 0 em SKUs de alto volume? Isso é plausível?
 
 # Identificar zeros em SKUs com mediana alta
