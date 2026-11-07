@@ -331,44 +331,53 @@ def preparar_dados_modelo(dados_brutos: pd.DataFrame) -> pd.DataFrame:
     df = preparar_valores_ausentes_vendas(df, causal_imputation=True)
 
     iso_calendar = df["semana"].dt.isocalendar()
-    df["ano"] = iso_calendar.year.astype(int)
-    df["semana_iso"] = iso_calendar.week.astype(int)
-    df["mes"] = df["semana"].dt.month
+    # Semana ISO temporária, usada apenas para criar as variáveis cíclicas abaixo.
+    semana_iso = iso_calendar.week.astype(int)
 
     df = df.sort_values(["sku_id", "canal", "semana"]).copy()
 
     series_groups = df.groupby(["sku_id", "canal"], sort=False)
     sold_quantity = series_groups["qt_vendida"]
+    # Vendas anteriores ajudam o modelo a reconhecer o nível recente da série,
+    # sem incluir a semana que será prevista.
     for lag in [1, 2, 4, 8]:
-        df[f"lag_{lag}"] = sold_quantity.shift(lag)
-    df["roll_mean_4"] = sold_quantity.transform(
+        df[f"venda_defasada_{lag}"] = sold_quantity.shift(lag)
+
+    # Média das quatro semanas anteriores para representar o nível recente de venda.
+    df["media_movel_4"] = sold_quantity.transform(
         lambda values: values.shift(1).rolling(4).mean()
     )
-    df["roll_mean_8"] = sold_quantity.transform(
+
+    # Média das oito semanas anteriores para representar uma tendência mais estável.
+    df["media_movel_8"] = sold_quantity.transform(
         lambda values: values.shift(1).rolling(8).mean()
     )
-    df["roll_std_4"] = sold_quantity.transform(
+
+    # Desvio padrão das quatro semanas anteriores para medir a variação recente das vendas.
+    df["desvio_padrao_movel_4"] = sold_quantity.transform(
         lambda values: values.shift(1).rolling(4).std()
     )
+
+    # Quantidade de ruptura na semana anterior, como sinal de venda possivelmente limitada.
     previous_stockout = series_groups["qt_ruptura"].shift(1)
-    df["ruptura_lag1"] = previous_stockout
-    df["ruptura_flag_lag1"] = np.where(
+    df["ruptura_defasada_1"] = previous_stockout
+
+    # Indicador binário de ruptura na semana anterior; preserva ausência como NaN.
+    df["flag_ruptura_defasada_1"] = np.where(
         previous_stockout.isna(),
         np.nan,
         previous_stockout.gt(0).astype(int),
     )
 
-    df["wk_sin"] = np.sin(2 * np.pi * df["semana_iso"] / 52)
-    df["wk_cos"] = np.cos(2 * np.pi * df["semana_iso"] / 52)
-    df["dez"] = (df["mes"] == 12).astype(int)
-    df["tendencia"] = (df["semana"] - df["semana"].min()).dt.days / 7.0
+    # Seno da semana do ano para representar a sazonalidade sem salto no fim do ano.
+    df["semana_seno"] = np.sin(2 * np.pi * semana_iso / 52)
+
+    # Cosseno complementar ao seno para identificar a posição no ciclo anual.
+    df["semana_cosseno"] = np.cos(2 * np.pi * semana_iso / 52)
     return df
 
 ## Opcional: Executa para verificar se o carregamento e preparação funcionam corretamente e exibe o DataFrame resultante usado no modelo. 
 # Remova ou comente esta parte se não for necessária.
-"""""
 dados = carregar_dados_vendas()
 df_modelo = preparar_dados_modelo(dados)
-display(df_modelo)
-
-"""""
+df_modelo

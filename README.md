@@ -82,12 +82,12 @@ São comparados LightGBM e XGBoost. Categorias de SKU, canal e subcategoria são
 codificadas em one-hot. `preparar_dados_modelo`
 faz os tratamentos causais em `src/data_utils.py`: preço, desconto e margem
 ausentes usam histórico disponível, sem recorrer a semanas futuras ou à receita
-da semana prevista. Ausências de ruptura e dos lags derivados são mantidas como
-NaN e tratadas nativamente pelos estimadores. O LightGBM usa `linear_tree=True`
-para permitir componentes lineares nas folhas ao usar `tendencia`; os demais
-recursos representam histórico de venda, sazonalidade, ruptura anterior e
-preço/promoção. Preço e mecânicas promocionais precisam ser conhecidos antes da
-previsão (por exemplo, via plano comercial).
+da semana prevista. Ausências de ruptura e das variáveis históricas derivadas
+são mantidas como NaN e tratadas nativamente pelos estimadores. As entradas do
+modelo representam histórico de venda (`venda_defasada_*`, `media_movel_*` e
+`desvio_padrao_movel_4`), sazonalidade (`semana_seno` e `semana_cosseno`),
+ruptura anterior, preço e promoção. Preço e mecânicas promocionais precisam ser
+conhecidos antes da previsão (por exemplo, via plano comercial).
 
 O corte é móvel e se baseia nas semanas presentes no CSV. As 8 semanas finais
 ficam reservadas para teste. As 16 semanas imediatamente anteriores formam a
@@ -106,9 +106,11 @@ no teste final.
 O teste tem duração de oito semanas como janela de avaliação — dois ciclos
 mensais de planejamento S&OP, conforme a cadência descrita por Wallace e Stahl
 em *Sales & Operations Planning: The How-To Handbook*, 3ª ed. O horizonte
-operacional do estimador é, porém, uma semana à frente: a avaliação é
-walk-forward e usa os dados da semana anterior, não uma previsão única de oito
-semanas sem atualização. Como o CSV não informa lead times de fornecedores, a
+operacional do estimador é, porém, uma semana à frente: a cada semana do teste,
+os atributos históricos usam as vendas reais da semana anterior, inclusive
+quando essa semana já faz parte do teste. Portanto, as oito semanas avaliam
+oito previsões sucessivas de uma semana à frente; não simulam oito previsões
+feitas de uma só vez, sem atualização. Como o CSV não informa lead times de fornecedores, a
 janela bimestral é uma escolha de avaliação, não uma afirmação sobre o ciclo real
 de compra; deve ser validada com a área de negócio.
 
@@ -125,7 +127,32 @@ Para facilitar a leitura do resultado no negócio, a execução salva dois
 gráficos PNG em `outputs/model/`: `real_vs_previsto_venda_direta.png` e
 `real_vs_previsto_loja.png`. Cada gráfico mostra as séries de venda real e
 prevista no teste para os 20 SKUs daquele canal (40 combinações SKU-canal no
-total). A previsão pontual é avaliada com WAPE, MAE em unidades e viés.
+total), com uma faixa de incerteza empírica P90.
+
+Para mostrar quanto as previsões podem variar, usamos os erros de previsões
+feitas em semanas passadas que não participaram do treino daquela rodada. O
+cálculo é separado pelo tamanho da previsão: menos de 50, de 50 a 150 e mais
+de 150 unidades.
+
+`erro_p90_unidades` é um erro de referência em unidades para cada faixa. P90
+significa que, nas semanas usadas para esse cálculo, 90% dos erros absolutos
+ficaram nesse valor ou abaixo dele. Por exemplo, se uma previsão for de 100
+unidades e o erro P90 de sua faixa for 20, mostramos uma faixa de 80 a 120
+unidades (`previsao_inferior` e `previsao_superior`). A previsão inferior nunca
+fica abaixo de zero.
+
+`largura_faixa_pct` mostra o tamanho total dessa faixa comparado com a previsão.
+No exemplo, a faixa vai de 80 a 120: sua largura é 40 unidades, ou 40% da
+previsão de 100. Em geral, um percentual menor significa uma faixa mais estreita
+em relação ao volume previsto. Para uma previsão igual a zero, esse percentual
+não é calculado.
+
+A tabela `erro_oof_por_faixa`, retornada com os resultados, mostra o erro P90
+em unidades e quantas previsões passadas foram usadas em cada faixa. Se uma
+faixa não tiver observações, o erro aparece como indefinido; não usamos o erro
+de outra faixa no lugar. Essa faixa é uma referência baseada no histórico, não
+uma garantia de que o valor real ficará dentro dela. A previsão pontual continua
+avaliada com WAPE, MAE em unidades e viés.
 
 O console também mostra SKU_01 como exemplo por canal: WAPE e erro absoluto
 médio em unidades por semana, além de uma estimativa do valor bruto de vendas

@@ -1,4 +1,14 @@
-"""Compara modelos de venda semanal por validação cruzada temporal.
+"""Compara e avalia modelos de venda semanal com validação temporal.
+
+O modelo gera previsões de uma semana à frente. As oito semanas finais são
+reservadas para avaliar essa previsão semanal em sequência, atualizando os
+atributos históricos com as vendas reais da semana anterior; não representam
+uma previsão única de oito semanas à frente.
+
+Antes do teste, LightGBM e XGBoost são comparados em 16 semanas de validação
+cruzada temporal. O modelo vencedor pode receber ajuste de hiperparâmetros e,
+em seguida, é treinado com todos os dados anteriores às oito semanas finais.
+Essas semanas finais não participam da seleção nem do ajuste.
 
 Modelos:
 * LightGBM: rápido e eficiente em dados tabulares; modelos muito complexos
@@ -37,6 +47,8 @@ FOLD_WEEKS = 4
 TEST_WEEKS = 8
 RANDOM_STATE = 42
 RANDOM_SEARCH_ITERATIONS = 12
+PREDICTION_BUCKETS = ("<50", "50-150", ">150")
+ERROR_QUANTILE = 0.90
 MODEL_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "outputs" / "model"
 
 # Preço e mecânicas promocionais precisam ser conhecidos no momento da previsão.
@@ -46,18 +58,17 @@ NUMERIC_FEATURES = [
     "flag_desconto_direto",
     "flag_combo",
     "flag_pague_e_leve",
-    "wk_sin",
-    "wk_cos",
-    "tendencia",
-    "lag_1",
-    "lag_2",
-    "lag_4",
-    "lag_8",
-    "roll_mean_4",
-    "roll_mean_8",
-    "roll_std_4",
-    "ruptura_lag1",
-    "ruptura_flag_lag1",
+    "semana_seno",
+    "semana_cosseno",
+    "venda_defasada_1",
+    "venda_defasada_2",
+    "venda_defasada_4",
+    "venda_defasada_8",
+    "media_movel_4",
+    "media_movel_8",
+    "desvio_padrao_movel_4",
+    "ruptura_defasada_1",
+    "flag_ruptura_defasada_1",
 ]
 CATEGORICAL_FEATURES = ["sku_id", "canal", "subcategoria_id"]
 FEATURES = NUMERIC_FEATURES + CATEGORICAL_FEATURES
@@ -69,18 +80,17 @@ FEATURE_DESCRIPTIONS = {
     "flag_desconto_direto": "Indica promoção de desconto direto.",
     "flag_combo": "Indica participação em promoção do tipo combo.",
     "flag_pague_e_leve": "Indica promoção do tipo pague e leve.",
-    "wk_sin": "Componente seno que representa a posição cíclica da semana no ano.",
-    "wk_cos": "Componente cosseno que representa a posição cíclica da semana no ano.",
-    "tendencia": "Índice de tempo em semanas desde o início da série preparada.",
-    "lag_1": "Quantidade vendida na semana anterior para o mesmo SKU e canal.",
-    "lag_2": "Quantidade vendida duas semanas antes para o mesmo SKU e canal.",
-    "lag_4": "Quantidade vendida quatro semanas antes para o mesmo SKU e canal.",
-    "lag_8": "Quantidade vendida oito semanas antes para o mesmo SKU e canal.",
-    "roll_mean_4": "Média das quatro quantidades anteriores, sem incluir a semana prevista.",
-    "roll_mean_8": "Média das oito quantidades anteriores, sem incluir a semana prevista.",
-    "roll_std_4": "Variação das quatro quantidades anteriores.",
-    "ruptura_lag1": "Quantidade em ruptura na semana anterior.",
-    "ruptura_flag_lag1": "Indica se houve ruptura na semana anterior.",
+    "semana_seno": "Componente seno que representa a posição cíclica da semana no ano.",
+    "semana_cosseno": "Componente cosseno que representa a posição cíclica da semana no ano.",
+    "venda_defasada_1": "Quantidade vendida na semana anterior para o mesmo SKU e canal.",
+    "venda_defasada_2": "Quantidade vendida duas semanas antes para o mesmo SKU e canal.",
+    "venda_defasada_4": "Quantidade vendida quatro semanas antes para o mesmo SKU e canal.",
+    "venda_defasada_8": "Quantidade vendida oito semanas antes para o mesmo SKU e canal.",
+    "media_movel_4": "Média das quatro quantidades anteriores, sem incluir a semana prevista.",
+    "media_movel_8": "Média das oito quantidades anteriores, sem incluir a semana prevista.",
+    "desvio_padrao_movel_4": "Desvio padrão das vendas nas quatro semanas anteriores.",
+    "ruptura_defasada_1": "Quantidade em ruptura na semana anterior.",
+    "flag_ruptura_defasada_1": "Indica se houve ruptura na semana anterior.",
     "sku_id": "Identificador do SKU, codificado como categoria.",
     "canal": "Canal de venda, codificado como categoria.",
     "subcategoria_id": "Identificador da subcategoria, codificado como categoria.",
@@ -160,12 +170,19 @@ def _save_test_forecast_charts(predictions: pd.DataFrame) -> dict[str, Path]:
             )
             axis.plot(
                 group["semana"],
-                group["pred"],
+                group["previsao"],
                 marker="o",
                 markersize=2.5,
                 linewidth=1.2,
                 linestyle="--",
                 label="Previsto",
+            )
+            axis.fill_between(
+                group["semana"],
+                group["previsao_inferior"],
+                group["previsao_superior"],
+                alpha=0.15,
+                label="Faixa estimada (P90)",
             )
             axis.set_title(str(sku))
             axis.grid(alpha=0.25)
@@ -183,7 +200,7 @@ def _save_test_forecast_charts(predictions: pd.DataFrame) -> dict[str, Path]:
             legend_labels,
             loc="upper center",
             bbox_to_anchor=(0.5, 0.95),
-            ncol=2,
+            ncol=3,
         )
         figure.tight_layout(rect=(0.03, 0.03, 0.97, 0.91))
 
@@ -206,7 +223,7 @@ def _print_sku_business_translation(predictions: pd.DataFrame) -> None:
         return
 
     for channel, group in sku_predictions.groupby("canal", sort=True):
-        absolute_error = (group[TARGET] - group["pred"]).abs()
+        absolute_error = (group[TARGET] - group["previsao"]).abs()
         actual_volume = group[TARGET].abs().sum()
         wape = (
             absolute_error.sum() / actual_volume
@@ -223,7 +240,7 @@ def _print_sku_business_translation(predictions: pd.DataFrame) -> None:
             value_message = "valor em R$ não estimado: não há preço válido"
         else:
             gross_value_error = (
-                (priced_rows[TARGET] - priced_rows["pred"]).abs()
+                (priced_rows[TARGET] - priced_rows["previsao"]).abs()
                 * priced_rows["preco_medio"]
             ).mean()
             formatted_value = f"{gross_value_error:,.2f}".replace(",", "X")
@@ -333,6 +350,111 @@ def _evaluate_model(
         {"wape": float(np.mean(train_wapes))},
         scores,
     )
+
+
+def _prediction_buckets(predictions: pd.Series) -> pd.Series:
+    """Classifica previsões nas faixas de volume usadas na calibração."""
+    values = predictions.to_numpy()
+    if not np.isfinite(values).all():
+        raise ValueError("As previsões devem ser finitas para calcular a faixa.")
+
+    return pd.Series(
+        np.select(
+            [values < 50, values <= 150],
+            [PREDICTION_BUCKETS[0], PREDICTION_BUCKETS[1]],
+            default=PREDICTION_BUCKETS[2],
+        ),
+        index=predictions.index,
+        name="faixa_previsao",
+    )
+
+
+def _collect_oof_predictions(
+    estimator: BaseEstimator,
+    features: pd.DataFrame,
+    target: pd.Series,
+    folds: list[tuple[np.ndarray, np.ndarray]],
+) -> pd.DataFrame:
+    """Gera previsões OOF do estimador selecionado para calibrar os erros."""
+    predictions = []
+    for train_indices, validation_indices in folds:
+        x_train = features.iloc[train_indices]
+        x_validation = features.iloc[validation_indices]
+        y_train = target.iloc[train_indices]
+        if x_train.empty or x_validation.empty:
+            raise ValueError("Fold temporal sem linhas de treino ou validação.")
+
+        pipeline = _make_pipeline(clone(estimator))
+        pipeline.fit(x_train, y_train)
+        validation_prediction = np.clip(
+            pipeline.predict(x_validation), 0, None
+        )
+        validation_target = target.iloc[validation_indices]
+        predictions.append(
+            pd.DataFrame(
+                {
+                    "real": validation_target.to_numpy(),
+                    "previsao": validation_prediction,
+                },
+                index=validation_target.index,
+            )
+        )
+
+    if not predictions:
+        raise ValueError("Não há folds para calcular os erros OOF.")
+    oof_predictions = pd.concat(predictions).sort_index()
+    if oof_predictions.index.has_duplicates:
+        raise ValueError("Uma observação foi prevista em mais de um fold OOF.")
+    return oof_predictions
+
+
+def _oof_error_by_bucket(oof_predictions: pd.DataFrame) -> pd.DataFrame:
+    """Calcula o quantil P90 do erro absoluto OOF por faixa de previsão."""
+    buckets = _prediction_buckets(oof_predictions["previsao"])
+    absolute_errors = (
+        oof_predictions["real"] - oof_predictions["previsao"]
+    ).abs()
+    summary = []
+    for bucket in PREDICTION_BUCKETS:
+        errors = absolute_errors.loc[buckets == bucket]
+        summary.append(
+            {
+                "faixa_previsao": bucket,
+                "quantidade_oof": len(errors),
+                "erro_p90_unidades": (
+                    float(errors.quantile(ERROR_QUANTILE))
+                    if not errors.empty
+                    else float("nan")
+                ),
+            }
+        )
+    return pd.DataFrame(summary).set_index("faixa_previsao")
+
+
+def _add_prediction_intervals(
+    predictions: pd.DataFrame, error_by_bucket: pd.DataFrame
+) -> pd.DataFrame:
+    """Anexa faixa empírica P90 e sua largura relativa à previsão."""
+    result = predictions.copy()
+    prediction_buckets = _prediction_buckets(result["previsao"])
+    result["erro_p90_unidades"] = prediction_buckets.map(
+        error_by_bucket["erro_p90_unidades"]
+    )
+    result["previsao_inferior"] = (
+        result["previsao"] - result["erro_p90_unidades"]
+    ).clip(lower=0)
+    result["previsao_superior"] = (
+        result["previsao"] + result["erro_p90_unidades"]
+    )
+    result["largura_faixa_pct"] = np.nan
+    positive_predictions = result["previsao"] > 0
+    result.loc[positive_predictions, "largura_faixa_pct"] = (
+        2
+        * result.loc[positive_predictions, "erro_p90_unidades"]
+        / result.loc[positive_predictions, "previsao"]
+        * 100
+    )
+    return result
 
 
 def _random_search_best_model(
@@ -534,6 +656,25 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
     else:
         selected_pipeline = _make_pipeline(candidates[initial_winner])
 
+    selected_estimator = (
+        tuned_estimator
+        if selected_name == tuned_name
+        else candidates[initial_winner]
+    )
+    oof_predictions = _collect_oof_predictions(
+        selected_estimator, features, target, folds
+    )
+    error_by_bucket = _oof_error_by_bucket(oof_predictions)
+    print(
+        f"\nErro absoluto P{ERROR_QUANTILE:.0%} por faixa de previsão "
+        f"(unidades):\n"
+        + error_by_bucket.to_string(
+            formatters={
+                "erro_p90_unidades": lambda value: f"{value:.2f}"
+            }
+        )
+    )
+
     # Ajusta novamente somente com dados anteriores ao teste; as semanas finais
     # não podem participar nem do ajuste nem da escolha dos parâmetros.
     selected_pipeline.fit(pre_test[FEATURES], pre_test[TARGET])
@@ -543,13 +684,14 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
     train_scores = _metrics(pre_test[TARGET], train_prediction)
 
     predictions = test.copy()
-    predictions["pred"] = np.clip(
+    predictions["previsao"] = np.clip(
         selected_pipeline.predict(test[FEATURES]), 0, None
     )
+    predictions = _add_prediction_intervals(predictions, error_by_bucket)
 
     test_scores = _metrics(
         test[TARGET],
-        predictions["pred"].to_numpy(),
+        predictions["previsao"].to_numpy(),
     )
     chart_paths = _save_test_forecast_charts(predictions)
 
@@ -575,7 +717,11 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         "sku_id",
         "canal",
         TARGET,
-        "pred",
+        "previsao",
+        "erro_p90_unidades",
+        "previsao_inferior",
+        "previsao_superior",
+        "largura_faixa_pct",
     ]
     print("\nExemplos de previsões no teste:")
     print(predictions[display_columns].head(10).to_string(index=False))
@@ -592,6 +738,7 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         },
         "model_comparison": model_results,
         "best_hyperparameters": best_parameters,
+        "erro_oof_por_faixa": error_by_bucket,
         "feature_descriptions": FEATURE_DESCRIPTIONS,
         "periods": {
             "cross_validation": _period_description(
