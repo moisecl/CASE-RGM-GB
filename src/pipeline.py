@@ -12,7 +12,7 @@ def main() -> None:
     df = preparar_dados_modelo(carregar_dados_vendas())
     print(
         df.groupby("canal")[
-            ["demanda_real", "preco_medio", "desconto_pct"]
+            ["qt_vendida", "preco_medio", "desconto_pct"]
         ].mean()
     )
     run_model(df)

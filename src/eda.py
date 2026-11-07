@@ -7,7 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 if __package__:
-    from src.data_utils import (
+    from .data_utils import (
         EDA_OUTPUT_DIR,
         NUMERIC_COLUMNS,
         carregar_dados_vendas,
@@ -15,7 +15,7 @@ if __package__:
         remover_duplicatas_vendas,
     )
 else:
-    from src.data_utils import (
+    from data_utils import (
         EDA_OUTPUT_DIR,
         NUMERIC_COLUMNS,
         carregar_dados_vendas,
@@ -367,7 +367,9 @@ print(casos_receita_quantidade)
 
 missing_antes = df.isna().sum()
 subcategorias_antes = df['subcategoria_id'].isna().sum()
-df = preparar_valores_ausentes_vendas(df)
+# Na EDA exploratória, usamos toda a série para descrever/imputar distribuições;
+# esse modo não é apropriado para prever semanas futuras.
+df = preparar_valores_ausentes_vendas(df, causal_imputation=False)
 print(
     '\nQuantidade vendida negativa após ajuste:',
     int(df['qt_vendida'].lt(0).sum()),
@@ -542,7 +544,7 @@ E como a sazonalidade de fim de ano influencia na ruptura, é possível ver uma 
 nas últimas semanas do ano
 
 Para as análises de demanda a seguir, optou-se por avaliar a Demanda real, somando os valores
-de Valor vendido e Quantidade rupturada (deixou de ser vendido) 
+de Valor vendido e Quantidade rupturada (deixou de ser vendido) para se ter uma melhor leitura da real necessidade dos consumidores
 """
 
 ## Criar coluna de demanda real (qt_vendida + qt_ruptura)
@@ -956,43 +958,3 @@ o maior range foi SKU 04 com variação de 3,76 p.p, enquanto o SKU_02 com 1,4p.
 Entretando, quando avaliamos a margem entre SKUs, o SKU 04 trabalha com margens entre 26 e 30%, a menor entre todos os 
 SKUs, bem distante da margem praticada pelo TOP SKU, SKU 01, e o SKU 11 com margens entre 57 e 61%.
 """
-
-#-------------------------------------------------------------------------------#
-######### Exlcuir da análise e do modelo #################
-
-# Existem semanas com demanda_real = 0 em SKUs de alto volume? Isso é plausível?
-
-# Identificar zeros em SKUs com mediana alta
-med_sku = df.groupby('sku_id')['demanda_real'].transform('median')
-zeros_suspeitos = df[(df['demanda_real'] == 0) & (med_sku > 20)].copy()
-print(f'\nZeros "suspeitos" (SKU com mediana > 20 un./sem e demanda = 0): {len(zeros_suspeitos)}')
-print(zeros_suspeitos[['sku_id','canal','semana_dt','demanda_real','qt_ruptura','receita']]
-        .sort_values(['sku_id','semana_dt']).head(20))
-
-# Visual: demanda semanal média entre canais para o SKU_01 (alto volume)
-d = (
-    df[df['sku_id'] == 'SKU_01']
-    .groupby('semana_dt', as_index=False)['demanda_real']
-    .mean()
-)
-fig, ax = plt.subplots(figsize=(16, 4))
-sns.lineplot(data=d, x='semana_dt', y='demanda_real', ax=ax, color='#3f7180', linewidth=1.8)
-zeros = d[d['demanda_real'] == 0]
-ax.scatter(zeros['semana_dt'], zeros['demanda_real'], color='#c66b4e', s=65,
-           zorder=5, label='Demanda = 0 (suspeita)')
-ax.set_title('SKU_01 — todos os canais: semanas com demanda média igual a 0')
-ax.set_ylabel('Demanda real (unidades)')
-ax.spines[['top', 'right']].set_visible(False)
-ax.legend()
-save_show(fig, '19_zeros_suspeitos_sku01')
-
-"""
-Interpretação: zeros isolados em um SKU de volume historicamente alto podem
-representar falha de registro ou indisponibilidade, e não necessariamente
-ausência real de procura. Os pontos marcados são tratados como alvo ausente
-pela regra abaixo, evitando treinar o modelo como se fossem demanda confirmada igual a zero.
-"""
-
-df['zero_suspeito'] = (df['demanda_real'] == 0) & (med_sku > 20)
-df.loc[df['zero_suspeito'], 'demanda_real'] = np.nan
-print(f'\nObservações marcadas como NaN no alvo: {df["zero_suspeito"].sum()}')
