@@ -1,15 +1,12 @@
 """Compara modelos de venda semanal por validação cruzada temporal.
 
 Modelos:
-* Random Forest (baseline): simples e robusto a relações não lineares; pode
-  ficar pesado e não extrapola tendências além do observado.
 * LightGBM: rápido e eficiente em dados tabulares; modelos muito complexos
   podem sobreajustar e árvores não extrapolam tendências.
 * XGBoost: boosting flexível, com regularização e bom desempenho tabular;
   pode exigir mais tempo/recursos e árvores também não extrapolam tendências.
 
 Referências:
-* Random Forest: https://scikit-learn.org/stable/modules/ensemble.html#forests-of-randomized-trees
 * LightGBM: https://lightgbm.readthedocs.io/en/stable/
 * XGBoost: https://xgboost.readthedocs.io/en/stable/
 """
@@ -17,24 +14,23 @@ Referências:
 import numpy as np
 import pandas as pd
 from lightgbm import LGBMRegressor
-from sklearn.base import BaseEstimator
+from sklearn.base import BaseEstimator, clone
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error
-from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
+from sklearn.model_selection import RandomizedSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 from xgboost import XGBRegressor
 
 if __package__:
-    from .data_utils import carregar_dados_vendas, preparar_dados_modelo
+    from src.data_utils import carregar_dados_vendas, preparar_dados_modelo
 else:
-    from data_utils import carregar_dados_vendas, preparar_dados_modelo
+    from src.data_utils import carregar_dados_vendas, preparar_dados_modelo
 
 
 TARGET = "qt_vendida"
 CV_WEEKS = 16
-FOLD_WEEKS = 8
+FOLD_WEEKS = 4
 TEST_WEEKS = 8
 RANDOM_STATE = 42
 INTERVAL_COVERAGE = 0.90
@@ -106,11 +102,6 @@ def _make_pipeline(estimator: BaseEstimator) -> Pipeline:
     )
 
 
-def _complete_rows(features: pd.DataFrame) -> pd.Series:
-    """Identifica linhas sem valores ausentes para uso pelo Random Forest."""
-    return features.notna().all(axis=1)
-
-
 def _metrics(actual: pd.Series, predicted: np.ndarray) -> dict[str, float]:
     """Calcula WAPE, MAE e viés percentual."""
     denominator = actual.abs().sum()
@@ -144,23 +135,34 @@ def _period_description(frame: pd.DataFrame) -> str:
 def _make_temporal_folds(
     frame: pd.DataFrame, weeks: pd.Index
 ) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Cria folds expansivos pelo TimeSeriesSplit em blocos de 8 semanas."""
-    splitter = TimeSeriesSplit(
-        n_splits=CV_WEEKS // FOLD_WEEKS,
-        test_size=FOLD_WEEKS,
-    )
+    """Cria folds expansivos contíguos que cobrem todas as semanas de CV."""
+    if FOLD_WEEKS <= 0 or CV_WEEKS % FOLD_WEEKS:
+        raise ValueError("CV_WEEKS deve ser divisível por FOLD_WEEKS.")
+
+    all_weeks = pd.Index(frame["semana"].drop_duplicates().sort_values())
+    weeks = pd.Index(weeks)
+    if len(weeks) != CV_WEEKS or not weeks.isin(all_weeks).all():
+        raise ValueError(
+            f"A validação deve conter exatamente {CV_WEEKS} semanas presentes "
+            "no conjunto de dados."
+        )
+
     folds = []
-    for train_week_indices, validation_week_indices in splitter.split(weeks):
-        train_dates = weeks[train_week_indices]
-        validation_dates = weeks[validation_week_indices]
+    for start in range(0, len(weeks), FOLD_WEEKS):
+        validation_dates = weeks[start : start + FOLD_WEEKS]
+        train_dates = all_weeks[all_weeks < validation_dates.min()]
         train_indices = np.flatnonzero(frame["semana"].isin(train_dates))
         validation_indices = np.flatnonzero(
             frame["semana"].isin(validation_dates)
         )
+        if not len(train_indices):
+            raise ValueError("O fold temporal não contém semanas de treino.")
         if train_dates.max() >= validation_dates.min():
             raise ValueError("O fold temporal inclui treino posterior à validação.")
         if len(validation_dates) != FOLD_WEEKS:
-            raise ValueError("O fold não contém exatamente 8 semanas.")
+            raise ValueError(
+                f"O fold não contém exatamente {FOLD_WEEKS} semanas."
+            )
         folds.append((train_indices, validation_indices))
     return folds
 
@@ -168,12 +170,9 @@ def _make_temporal_folds(
 def _negative_wape(
     estimator: Pipeline, features: pd.DataFrame, actual: pd.Series
 ) -> float:
-    """Pontua a busca pelo negativo da WAPE nas mesmas linhas completas."""
-    complete = _complete_rows(features)
-    if not complete.any():
-        raise ValueError("Não há linhas completas nesta janela de validação.")
-    predicted = np.clip(estimator.predict(features.loc[complete]), 0, None)
-    return -_metrics(actual.loc[complete], predicted)["wape"]
+    """Pontua a busca pelo negativo da WAPE em todas as linhas."""
+    predicted = np.clip(estimator.predict(features), 0, None)
+    return -_metrics(actual, predicted)["wape"]
 
 
 def _evaluate_model(
@@ -181,41 +180,30 @@ def _evaluate_model(
     features: pd.DataFrame,
     target: pd.Series,
     folds: list[tuple[np.ndarray, np.ndarray]],
-    model_name: str,
 ) -> tuple[dict[str, float], dict[str, float], pd.Series]:
     """Avalia um modelo nos folds e devolve métricas e previsões fora da amostra."""
     out_of_fold = pd.Series(np.nan, index=features.index, dtype=float)
     train_wapes = []
-    common_complete = _complete_rows(features)
 
     for train_indices, validation_indices in folds:
         x_train = features.iloc[train_indices]
         y_train = target.iloc[train_indices]
         x_validation = features.iloc[validation_indices]
-        validation_mask = common_complete.iloc[validation_indices]
-        if model_name == "Random Forest":
-            train_mask = _complete_rows(x_train)
-        else:
-            train_mask = pd.Series(True, index=x_train.index)
-        if not train_mask.any() or not validation_mask.any():
-            raise ValueError(
-                f"Sem linhas válidas para avaliação do modelo {model_name}."
-            )
+        if x_train.empty or x_validation.empty:
+            raise ValueError("Fold temporal sem linhas de treino ou validação.")
 
         pipeline = _make_pipeline(estimator)
-        pipeline.fit(x_train.loc[train_mask], y_train.loc[train_mask])
+        pipeline.fit(x_train, y_train)
         train_prediction = np.clip(
-            pipeline.predict(x_train.loc[train_mask]), 0, None
+            pipeline.predict(x_train), 0, None
         )
         validation_prediction = np.clip(
-            pipeline.predict(x_validation.loc[validation_mask]), 0, None
+            pipeline.predict(x_validation), 0, None
         )
         train_wapes.append(
-            _metrics(y_train.loc[train_mask], train_prediction)["wape"]
+            _metrics(y_train, train_prediction)["wape"]
         )
-        out_of_fold.loc[x_validation.index[validation_mask]] = (
-            validation_prediction
-        )
+        out_of_fold.loc[x_validation.index] = validation_prediction
 
     scored = out_of_fold.notna()
     scores = _metrics(target.loc[scored], out_of_fold.loc[scored].to_numpy())
@@ -249,13 +237,6 @@ def _random_search_best_model(
 ) -> tuple[BaseEstimator, dict[str, object], float]:
     """Ajusta por busca aleatória apenas o modelo que venceu a validação."""
     parameter_spaces = {
-        "Random Forest": {
-            "model__n_estimators": [100, 200, 300, 500],
-            "model__max_depth": [None, 10, 20, 30],
-            "model__min_samples_split": [2, 5, 10],
-            "model__min_samples_leaf": [1, 2, 4],
-            "model__max_features": [1.0, 0.7, "sqrt"],
-        },
         "LightGBM": {
             "model__n_estimators": [100, 200, 300, 500],
             "model__learning_rate": [0.03, 0.05, 0.1],
@@ -283,42 +264,19 @@ def _random_search_best_model(
         # Desativa somente as mensagens internas durante as muitas tentativas.
         estimator.set_params(verbosity=-1)
 
-    # O Random Forest não aceita NaN; a busca usa só linhas completas, mas
-    # mantém as mesmas datas dos folds definidas no conjunto completo.
-    search_mask = (
-        _complete_rows(features)
-        if model_name == "Random Forest"
-        else pd.Series(True, index=features.index)
-    )
-    search_features = features.loc[search_mask]
-    search_target = target.loc[search_mask]
-    original_positions = np.flatnonzero(search_mask.to_numpy())
-    position_map = np.full(len(features), -1, dtype=int)
-    position_map[original_positions] = np.arange(len(original_positions))
-    search_folds = []
-    for train_indices, validation_indices in folds:
-        mapped_train = position_map[train_indices]
-        mapped_validation = position_map[validation_indices]
-        search_folds.append(
-            (
-                mapped_train[mapped_train >= 0],
-                mapped_validation[mapped_validation >= 0],
-            )
-        )
-
     search = RandomizedSearchCV(
         estimator=_make_pipeline(estimator),
         param_distributions=parameter_spaces[model_name],
         n_iter=RANDOM_SEARCH_ITERATIONS,
         scoring=_negative_wape,
-        cv=search_folds,
+        cv=folds,
         refit=False,
         random_state=RANDOM_STATE,
         n_jobs=1,
         error_score="raise",
     )
-    search.fit(search_features, search_target)
-    best_model = estimator.__class__()
+    search.fit(features, target)
+    best_model = clone(estimator)
     model_parameters = {
         key.removeprefix("model__"): value
         for key, value in search.best_params_.items()
@@ -350,42 +308,40 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         )
 
     test_weeks = weeks[-TEST_WEEKS:]
-    cv_weeks = weeks[:-TEST_WEEKS]
-    cross_validation = data.loc[data["semana"].isin(cv_weeks)].reset_index(
+    cv_weeks = weeks[-CV_WEEKS - TEST_WEEKS : -TEST_WEEKS]
+    pre_test_weeks = weeks[:-TEST_WEEKS]
+    pre_test = data.loc[data["semana"].isin(pre_test_weeks)].reset_index(
         drop=True
     )
     test = data.loc[data["semana"].isin(test_weeks)].copy()
-    folds = _make_temporal_folds(cross_validation, cv_weeks)
-    if len(folds) != CV_WEEKS // FOLD_WEEKS:
+    folds = _make_temporal_folds(pre_test, cv_weeks)
+    expected_folds = CV_WEEKS // FOLD_WEEKS
+    if len(folds) != expected_folds:
         raise ValueError("Não foi possível formar os folds temporais esperados.")
 
     print(f"Alvo previsto: {TARGET}")
     print(
-        f"Validação cruzada: TimeSeriesSplit expansivo em {CV_WEEKS} semanas, "
-        f"com {len(folds)} blocos de teste de {FOLD_WEEKS} semanas."
+        f"Validação cruzada: janela expansiva de {CV_WEEKS} semanas, "
+        f"com {len(folds)} blocos contíguos de {FOLD_WEEKS} semanas."
     )
     for fold_index, (train_indices, validation_indices) in enumerate(folds, 1):
-        fold_train = cross_validation.iloc[train_indices]
-        fold_validation = cross_validation.iloc[validation_indices]
+        fold_train = pre_test.iloc[train_indices]
+        fold_validation = pre_test.iloc[validation_indices]
         print(
             f"Fold {fold_index}: treino {_period_description(fold_train)}; "
             f"validação {_period_description(fold_validation)}."
         )
     print(f"Teste final intocado: {_period_description(test)}")
-    print(
-        "NaN numéricos: LightGBM/XGBoost usam o tratamento nativo; "
-        "Random Forest exclui as linhas incompletas."
-    )
+    print("NaN numéricos são tratados nativamente pelos modelos de boosting.")
     print(
         "Os folds também estimam a faixa provável da previsão; "
         "não é necessário reservar outro período."
     )
 
-    features = cross_validation[FEATURES]
-    target = cross_validation[TARGET]
+    features = pre_test[FEATURES]
+    target = pre_test[TARGET]
     candidates: dict[str, BaseEstimator] = {
-        "LightGBM": LGBMRegressor(),
-        "Random Forest": RandomForestRegressor(),
+        "LightGBM": LGBMRegressor(verbosity=-1),
         "XGBoost": XGBRegressor(),
     }
     model_results = {}
@@ -394,7 +350,7 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
     print("\nComparação dos modelos padrão nos folds temporais:")
     for name, estimator in candidates.items():
         train_scores, cv_scores, oof_predictions = _evaluate_model(
-            estimator, features, target, folds, name
+            estimator, features, target, folds
         )
         model_results[name] = {
             "train": train_scores,
@@ -403,7 +359,7 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         out_of_fold_predictions[name] = oof_predictions
         print(
             f"{name:16s} | erro treino: {train_scores['wape']:.2%} "
-            f"| erro médio nos 16 períodos: {cv_scores['wape']:.2%} "
+            f"| WAPE OOF nas {CV_WEEKS} semanas: {cv_scores['wape']:.2%} "
             f"| erro médio: {cv_scores['mae']:.2f} unidades "
             f"| tendência a super/subestimar: {cv_scores['bias']:.2%}"
         )
@@ -432,11 +388,11 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         )
     )
     tuned_train_scores, tuned_cv_scores, tuned_oof = _evaluate_model(
-        tuned_estimator, features, target, folds, initial_winner
+        tuned_estimator, features, target, folds
     )
     print(f"Menor erro médio encontrado na busca: {search_cv_wape:.2%}")
     print(
-        f"Erro médio de {initial_winner} ajustado nos 16 períodos: "
+        f"WAPE OOF de {initial_winner} ajustado nas {CV_WEEKS} semanas: "
         f"{tuned_cv_scores['wape']:.2%}"
     )
     parameter_names = {
@@ -448,9 +404,6 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         "colsample_bytree": "proporção de variáveis por árvore",
         "min_child_weight": "peso mínimo por folha",
         "reg_lambda": "regularização",
-        "min_samples_split": "mínimo de linhas para dividir nó",
-        "min_samples_leaf": "mínimo de linhas por folha",
-        "max_features": "variáveis consideradas por divisão",
         "min_child_samples": "mínimo de linhas por folha",
         "num_leaves": "máximo de folhas",
     }
@@ -480,7 +433,6 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         selected_pipeline = _make_pipeline(tuned_estimator)
     else:
         selected_pipeline = _make_pipeline(candidates[initial_winner])
-    selected_model_type = initial_winner
 
     selected_oof = out_of_fold_predictions[selected_name]
     oof_valid = selected_oof.notna()
@@ -492,74 +444,43 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
 
     # Ajusta novamente somente com dados anteriores ao teste; as semanas finais
     # não podem participar nem do ajuste nem da escolha dos parâmetros.
-    final_mask = (
-        _complete_rows(cross_validation[FEATURES])
-        if selected_model_type == "Random Forest"
-        else pd.Series(True, index=cross_validation.index)
-    )
-    selected_pipeline.fit(
-        cross_validation.loc[final_mask, FEATURES],
-        cross_validation.loc[final_mask, TARGET],
-    )
+    selected_pipeline.fit(pre_test[FEATURES], pre_test[TARGET])
     train_prediction = np.clip(
-        selected_pipeline.predict(
-            cross_validation.loc[final_mask, FEATURES]
-        ),
-        0,
-        None,
+        selected_pipeline.predict(pre_test[FEATURES]), 0, None
     )
-    train_scores = _metrics(
-        cross_validation.loc[final_mask, TARGET], train_prediction
-    )
+    train_scores = _metrics(pre_test[TARGET], train_prediction)
 
-    test_mask = (
-        _complete_rows(test[FEATURES])
-        if selected_model_type == "Random Forest"
-        else pd.Series(True, index=test.index)
-    )
     predictions = test.copy()
-    predictions["pred"] = np.nan
-    predictions.loc[test_mask, "pred"] = np.clip(
-        selected_pipeline.predict(test.loc[test_mask, FEATURES]), 0, None
+    predictions["pred"] = np.clip(
+        selected_pipeline.predict(test[FEATURES]), 0, None
     )
-    predictions["pred_lo"] = np.nan
-    predictions["pred_hi"] = np.nan
-    predictions.loc[test_mask, "pred_lo"] = np.maximum(
-        predictions.loc[test_mask, "pred"] - interval_radius, 0
+    predictions["pred_lo"] = np.maximum(
+        predictions["pred"] - interval_radius, 0
     )
-    predictions.loc[test_mask, "pred_hi"] = (
-        predictions.loc[test_mask, "pred"] + interval_radius
-    )
-    interval_width = (
-        predictions.loc[test_mask, "pred_hi"]
-        - predictions.loc[test_mask, "pred_lo"]
-    )
-    relative_width = interval_width / predictions.loc[test_mask, "pred"].clip(
-        lower=1
-    )
-    predictions["largura_relativa_intervalo"] = np.nan
-    predictions.loc[test_mask, "largura_relativa_intervalo"] = relative_width
-    predictions["confiabilidade"] = "Sem previsão: dados ausentes"
-    predictions.loc[test_mask, "confiabilidade"] = np.select(
+    predictions["pred_hi"] = predictions["pred"] + interval_radius
+    interval_width = predictions["pred_hi"] - predictions["pred_lo"]
+    relative_width = interval_width / predictions["pred"].clip(lower=1)
+    predictions["largura_relativa_intervalo"] = relative_width
+    predictions["confiabilidade"] = np.select(
         [relative_width <= 0.5, relative_width <= 1.0],
         ["Alta", "Média"],
         default="Baixa",
     )
 
     test_scores = _metrics(
-        test.loc[test_mask, TARGET],
-        predictions.loc[test_mask, "pred"].to_numpy(),
+        test[TARGET],
+        predictions["pred"].to_numpy(),
     )
     test_coverage = float(
         (
-            (test.loc[test_mask, TARGET] >= predictions.loc[test_mask, "pred_lo"])
-            & (test.loc[test_mask, TARGET] <= predictions.loc[test_mask, "pred_hi"])
+            (test[TARGET] >= predictions["pred_lo"])
+            & (test[TARGET] <= predictions["pred_hi"])
         ).mean()
     )
 
     print("\nResultado final do modelo selecionado:")
     print(f"Modelo: {selected_name}")
-    print(f"Período usado para ajuste final: {_period_description(cross_validation)}")
+    print(f"Período usado para ajuste final: {_period_description(pre_test)}")
     print(
         f"Treino | erro percentual: {train_scores['wape']:.2%} "
         f"| erro médio: {train_scores['mae']:.2f} unidades "
@@ -573,7 +494,7 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
     print(
         f"Faixa estimada para {INTERVAL_COVERAGE:.0%} das previsões: "
         f"até +/- {interval_radius:.2f} unidades, calculada com os erros "
-        f"fora da amostra dos 16 folds."
+        f"fora da amostra das {CV_WEEKS} semanas de validação."
     )
     print(
         f"Na prática, a faixa cobriu {test_coverage:.1%} das vendas reais "
@@ -614,14 +535,14 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
             **test_scores,
         },
         "model_comparison": model_results,
-        "best_xgboost_parameters": best_parameters,
+        "best_hyperparameters": best_parameters,
         "feature_descriptions": FEATURE_DESCRIPTIONS,
         "periods": {
             "cross_validation": _period_description(
-                cross_validation.loc[cross_validation["semana"].isin(cv_weeks)]
+                pre_test.loc[pre_test["semana"].isin(cv_weeks)]
             ),
             "test": _period_description(test),
-            "final_train": _period_description(cross_validation),
+            "final_train": _period_description(pre_test),
         },
     }
 

@@ -146,8 +146,7 @@ def _imputar_qtd_receita_preco(
     """Imputa preço e recupera quantidade/receita antes de descartar casos inválidos.
 
     No modo causal, usa somente preços históricos; se não houver referência
-    anterior, preserva o NaN para o tratamento nativo do LightGBM/XGBoost ou
-    para o ``dropna`` aplicado ao Random Forest.
+    anterior, preserva o NaN para o tratamento nativo do LightGBM/XGBoost.
     """
     if "qt_vendida_raw" not in df.columns:
         df["qt_vendida_raw"] = df["qt_vendida"]
