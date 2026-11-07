@@ -11,6 +11,9 @@ Referências:
 * XGBoost: https://xgboost.readthedocs.io/en/stable/
 """
 
+from pathlib import Path
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from lightgbm import LGBMRegressor
@@ -33,8 +36,8 @@ CV_WEEKS = 16
 FOLD_WEEKS = 4
 TEST_WEEKS = 8
 RANDOM_STATE = 42
-INTERVAL_COVERAGE = 0.90
 RANDOM_SEARCH_ITERATIONS = 12
+MODEL_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "outputs" / "model"
 
 # Preço e mecânicas promocionais precisam ser conhecidos no momento da previsão.
 NUMERIC_FEATURES = [
@@ -123,6 +126,121 @@ def _metrics(actual: pd.Series, predicted: np.ndarray) -> dict[str, float]:
     }
 
 
+def _save_test_forecast_charts(predictions: pd.DataFrame) -> dict[str, Path]:
+    """Salva um gráfico com 20 painéis por canal, cada um para um SKU."""
+    channels = {
+        "Venda Direta": "venda_direta",
+        "Loja": "loja",
+    }
+    MODEL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    chart_paths = {}
+    for channel, filename in channels.items():
+        channel_predictions = predictions.loc[
+            predictions["canal"] == channel
+        ].sort_values(["sku_id", "semana"])
+        skus = channel_predictions["sku_id"].drop_duplicates().sort_values()
+        if len(skus) != 20:
+            raise ValueError(
+                f"Esperados 20 SKU-canal no canal {channel}; "
+                f"foram encontrados {len(skus)}."
+            )
+
+        figure, axes = plt.subplots(4, 5, figsize=(20, 13), sharex=True)
+        for axis, sku in zip(axes.flat, skus):
+            group = channel_predictions.loc[
+                channel_predictions["sku_id"] == sku
+            ].sort_values("semana")
+            axis.plot(
+                group["semana"],
+                group[TARGET],
+                marker="o",
+                markersize=2.5,
+                linewidth=1.2,
+                label="Real",
+            )
+            axis.plot(
+                group["semana"],
+                group["pred"],
+                marker="o",
+                markersize=2.5,
+                linewidth=1.2,
+                linestyle="--",
+                label="Previsto",
+            )
+            axis.set_title(str(sku))
+            axis.grid(alpha=0.25)
+            axis.tick_params(axis="x", labelrotation=45, labelsize=7)
+            axis.tick_params(axis="y", labelsize=8)
+
+        figure.suptitle(
+            f"Vendas reais vs. previstas no teste — canal {channel}"
+        )
+        figure.supxlabel("Semana")
+        figure.supylabel("Unidades vendidas")
+        legend_handles, legend_labels = axes.flat[0].get_legend_handles_labels()
+        figure.legend(
+            legend_handles,
+            legend_labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.95),
+            ncol=2,
+        )
+        figure.tight_layout(rect=(0.03, 0.03, 0.97, 0.91))
+
+        output_path = (
+            MODEL_OUTPUT_DIR / f"real_vs_previsto_{filename}.png"
+        )
+        figure.savefig(output_path, dpi=160, bbox_inches="tight")
+        plt.close(figure)
+        chart_paths[channel] = output_path
+
+    return chart_paths
+
+
+def _print_sku_business_translation(predictions: pd.DataFrame) -> None:
+    """Traduz o erro de SKU_01 em unidades e valor bruto de vendas aproximado."""
+    sku_predictions = predictions.loc[predictions["sku_id"] == "SKU_01"]
+    print("\nExemplo de tradução do erro para KPI de negócio (SKU_01):")
+    if sku_predictions.empty:
+        print("SKU_01 não aparece no período de teste; KPI de exemplo indisponível.")
+        return
+
+    for channel, group in sku_predictions.groupby("canal", sort=True):
+        absolute_error = (group[TARGET] - group["pred"]).abs()
+        actual_volume = group[TARGET].abs().sum()
+        wape = (
+            absolute_error.sum() / actual_volume
+            if actual_volume
+            else float("nan")
+        )
+        mae_units = absolute_error.mean()
+        priced_rows = group.loc[
+            group["preco_medio"].notna()
+            & np.isfinite(group["preco_medio"])
+            & group["preco_medio"].ge(0)
+        ]
+        if priced_rows.empty:
+            value_message = "valor em R$ não estimado: não há preço válido"
+        else:
+            gross_value_error = (
+                (priced_rows[TARGET] - priced_rows["pred"]).abs()
+                * priced_rows["preco_medio"]
+            ).mean()
+            formatted_value = f"{gross_value_error:,.2f}".replace(",", "X")
+            formatted_value = formatted_value.replace(".", ",").replace("X", ".")
+            value_message = (
+                f"valor bruto associado ao erro aprox. R$ {formatted_value}"
+                + f"/semana, média de {len(priced_rows)} semanas com preço"
+            )
+
+        print(
+            f"SKU_01 | canal {channel}: WAPE {wape:.1%}; erro absoluto médio "
+            f"{mae_units:.1f} un./semana; {value_message}. "
+            "É uma proxy sobre vendas observadas, não o custo financeiro "
+            "efetivo de excesso de estoque ou ruptura."
+        )
+
+
 def _period_description(frame: pd.DataFrame) -> str:
     """Descreve as datas cobertas, semanas e linhas de um período."""
     return (
@@ -180,10 +298,11 @@ def _evaluate_model(
     features: pd.DataFrame,
     target: pd.Series,
     folds: list[tuple[np.ndarray, np.ndarray]],
-) -> tuple[dict[str, float], dict[str, float], pd.Series]:
-    """Avalia um modelo nos folds e devolve métricas e previsões fora da amostra."""
-    out_of_fold = pd.Series(np.nan, index=features.index, dtype=float)
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Avalia o modelo nos folds temporais e calcula métricas OOF agregadas."""
     train_wapes = []
+    validation_targets = []
+    validation_predictions = []
 
     for train_indices, validation_indices in folds:
         x_train = features.iloc[train_indices]
@@ -203,28 +322,16 @@ def _evaluate_model(
         train_wapes.append(
             _metrics(y_train, train_prediction)["wape"]
         )
-        out_of_fold.loc[x_validation.index] = validation_prediction
+        validation_targets.append(target.iloc[validation_indices])
+        validation_predictions.append(validation_prediction)
 
-    scored = out_of_fold.notna()
-    scores = _metrics(target.loc[scored], out_of_fold.loc[scored].to_numpy())
+    scores = _metrics(
+        pd.concat(validation_targets),
+        np.concatenate(validation_predictions),
+    )
     return (
         {"wape": float(np.mean(train_wapes))},
         scores,
-        out_of_fold,
-    )
-
-
-def _interval_radius(errors: np.ndarray, coverage: float) -> float:
-    """Calcula a largura do intervalo pelo quantil dos erros dos folds."""
-    sorted_errors = np.sort(errors)
-    if not len(sorted_errors):
-        raise ValueError("Não há erros dos folds para estimar a confiabilidade.")
-
-    rank = int(np.ceil((len(sorted_errors) + 1) * coverage))
-    return (
-        float("inf")
-        if rank > len(sorted_errors)
-        else float(sorted_errors[rank - 1])
     )
 
 
@@ -333,35 +440,29 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         )
     print(f"Teste final intocado: {_period_description(test)}")
     print("NaN numéricos são tratados nativamente pelos modelos de boosting.")
-    print(
-        "Os folds também estimam a faixa provável da previsão; "
-        "não é necessário reservar outro período."
-    )
 
     features = pre_test[FEATURES]
     target = pre_test[TARGET]
     candidates: dict[str, BaseEstimator] = {
-        "LightGBM": LGBMRegressor(verbosity=-1),
-        "XGBoost": XGBRegressor(),
+        "LightGBM": LGBMRegressor(verbosity=-1, random_state=RANDOM_STATE),
+        "XGBoost": XGBRegressor(random_state=RANDOM_STATE),
     }
     model_results = {}
-    out_of_fold_predictions = {}
 
     print("\nComparação dos modelos padrão nos folds temporais:")
     for name, estimator in candidates.items():
-        train_scores, cv_scores, oof_predictions = _evaluate_model(
+        train_scores, cv_scores = _evaluate_model(
             estimator, features, target, folds
         )
         model_results[name] = {
             "train": train_scores,
             "cross_validation": cv_scores,
         }
-        out_of_fold_predictions[name] = oof_predictions
         print(
             f"{name:16s} | erro treino: {train_scores['wape']:.2%} "
-            f"| WAPE OOF nas {CV_WEEKS} semanas: {cv_scores['wape']:.2%} "
-            f"| erro médio: {cv_scores['mae']:.2f} unidades "
-            f"| tendência a super/subestimar: {cv_scores['bias']:.2%}"
+            f"| WAPE Out of Folds nas {CV_WEEKS} semanas: {cv_scores['wape']:.2%} "
+            f"| Erro médio (MAE): {cv_scores['mae']:.2f} unidades "
+            f"| Tendência a super/subestimar (BIAS): {cv_scores['bias']:.2%}"
         )
 
     # Escolhe primeiro entre modelos padrão; o teste não participa da decisão.
@@ -387,12 +488,12 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
             folds,
         )
     )
-    tuned_train_scores, tuned_cv_scores, tuned_oof = _evaluate_model(
+    tuned_train_scores, tuned_cv_scores = _evaluate_model(
         tuned_estimator, features, target, folds
     )
     print(f"Menor erro médio encontrado na busca: {search_cv_wape:.2%}")
     print(
-        f"WAPE OOF de {initial_winner} ajustado nas {CV_WEEKS} semanas: "
+        f"WAPE Out of Folds de {initial_winner} ajustado nas {CV_WEEKS} semanas: "
         f"{tuned_cv_scores['wape']:.2%}"
     )
     parameter_names = {
@@ -418,7 +519,6 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         "train": tuned_train_scores,
         "cross_validation": tuned_cv_scores,
     }
-    out_of_fold_predictions[tuned_name] = tuned_oof
     # Mantém o modelo padrão se a busca não superar o vencedor original.
     selected_name = min(
         [initial_winner, tuned_name],
@@ -434,14 +534,6 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
     else:
         selected_pipeline = _make_pipeline(candidates[initial_winner])
 
-    selected_oof = out_of_fold_predictions[selected_name]
-    oof_valid = selected_oof.notna()
-    oof_errors = np.abs(
-        target.loc[oof_valid].to_numpy()
-        - selected_oof.loc[oof_valid].to_numpy()
-    )
-    interval_radius = _interval_radius(oof_errors, INTERVAL_COVERAGE)
-
     # Ajusta novamente somente com dados anteriores ao teste; as semanas finais
     # não podem participar nem do ajuste nem da escolha dos parâmetros.
     selected_pipeline.fit(pre_test[FEATURES], pre_test[TARGET])
@@ -454,72 +546,38 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
     predictions["pred"] = np.clip(
         selected_pipeline.predict(test[FEATURES]), 0, None
     )
-    predictions["pred_lo"] = np.maximum(
-        predictions["pred"] - interval_radius, 0
-    )
-    predictions["pred_hi"] = predictions["pred"] + interval_radius
-    interval_width = predictions["pred_hi"] - predictions["pred_lo"]
-    relative_width = interval_width / predictions["pred"].clip(lower=1)
-    predictions["largura_relativa_intervalo"] = relative_width
-    predictions["confiabilidade"] = np.select(
-        [relative_width <= 0.5, relative_width <= 1.0],
-        ["Alta", "Média"],
-        default="Baixa",
-    )
 
     test_scores = _metrics(
         test[TARGET],
         predictions["pred"].to_numpy(),
     )
-    test_coverage = float(
-        (
-            (test[TARGET] >= predictions["pred_lo"])
-            & (test[TARGET] <= predictions["pred_hi"])
-        ).mean()
-    )
+    chart_paths = _save_test_forecast_charts(predictions)
 
     print("\nResultado final do modelo selecionado:")
     print(f"Modelo: {selected_name}")
     print(f"Período usado para ajuste final: {_period_description(pre_test)}")
     print(
         f"Treino | erro percentual: {train_scores['wape']:.2%} "
-        f"| erro médio: {train_scores['mae']:.2f} unidades "
-        f"| tendência a super/subestimar: {train_scores['bias']:.2%}"
+        f"| Erro médio (MAE): {train_scores['mae']:.2f} unidades "
+        f"| Tendência a super/subestimar (BIAS): {train_scores['bias']:.2%}"
     )
     print(
         f"Teste  | erro percentual: {test_scores['wape']:.2%} "
-        f"| erro médio: {test_scores['mae']:.2f} unidades "
-        f"| tendência a super/subestimar: {test_scores['bias']:.2%}"
+        f"| Erro médio (MAE): {test_scores['mae']:.2f} unidades "
+        f"| Tendência a super/subestimar (BIAS): {test_scores['bias']:.2%}"
     )
-    print(
-        f"Faixa estimada para {INTERVAL_COVERAGE:.0%} das previsões: "
-        f"até +/- {interval_radius:.2f} unidades, calculada com os erros "
-        f"fora da amostra das {CV_WEEKS} semanas de validação."
-    )
-    print(
-        f"Na prática, a faixa cobriu {test_coverage:.1%} das vendas reais "
-        "no teste final."
-    )
-    print(
-        "Confiabilidade: Alta quando a faixa tem até 50% da previsão; "
-        "Média até 100%; Baixa acima de 100%. A categoria indica a largura "
-        "relativa da faixa, não uma probabilidade individual de acerto."
-    )
-    print(
-        "Distribuição de confiabilidade: "
-        f"{predictions['confiabilidade'].value_counts().to_dict()}"
-    )
+    print("Gráficos real vs. previsto por SKU-canal:")
+    for channel, chart_path in chart_paths.items():
+        print(f"  {channel}: {chart_path}")
+    _print_sku_business_translation(predictions)
     display_columns = [
         "semana",
         "sku_id",
         "canal",
         TARGET,
         "pred",
-        "pred_lo",
-        "pred_hi",
-        "confiabilidade",
     ]
-    print("\nExemplos de previsão, faixa plausível e grau de confiabilidade:")
+    print("\nExemplos de previsões no teste:")
     print(predictions[display_columns].head(10).to_string(index=False))
 
     return {
@@ -530,8 +588,6 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
             "train": train_scores,
             "cross_validation": model_results[selected_name]["cross_validation"],
             "test": test_scores,
-            "test_coverage": test_coverage,
-            "interval_radius": interval_radius,
             **test_scores,
         },
         "model_comparison": model_results,

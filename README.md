@@ -6,7 +6,6 @@
 - `src/data_utils.py`: caminhos, carregamento e preparação compartilhada.
 - `src/eda.py`: análise exploratória; salva gráficos em `outputs/eda/`.
 - `src/model.py`: treinamento, avaliação e interpretação do modelo.
-- `src/pipeline.py`: executa preparação e modelagem.
 
 Os caminhos de dados e de saída são resolvidos a partir da localização dos
 módulos. Assim, os scripts podem ser executados sem depender do diretório atual.
@@ -65,11 +64,10 @@ Na pasta `CASE_RGM_GB`:
 ```powershell
 python src\eda.py
 python src\model.py
-python src\pipeline.py
 ```
 
-`pipeline.py` prepara os dados e executa o modelo. Use `model.py` para treinar e
-avaliar somente o modelo. A EDA gera os gráficos em `outputs/eda/`.
+`model.py` carrega e prepara os dados antes de treinar e avaliar os modelos.
+A EDA gera os gráficos em `outputs/eda/`.
 O modelo exclui os registros anteriores a 2025-01-01 antes de criar os atributos
 temporais, pois 2024 tem apenas onze semanas observadas e possui comportamento atípico de demanda por SKU quando comparado à demanda de 2025 a 2026.
 
@@ -123,18 +121,22 @@ da validação pode ficar otimista por seleção repetida. Isso não expõe o ta
 do teste: o teste permanece fora da busca e da escolha e serve como avaliação
 final independente.
 
-As faixas preditivas são adaptativas e assimétricas: dois modelos LightGBM
-quantílicos estimam os quantis 5% e 95%, e os erros OOF calibram uma correção
-conformal global para cobertura nominal de 90%. `pred_lo` e `pred_hi` contêm
-os limites; `largura_intervalo` informa a amplitude em unidades. A cobertura
-observada no teste é impressa como verificação. A calibração é global e
-temporalmente dependente, portanto não significa uma probabilidade individual
-de acerto; não se exibe mais uma classificação de "confiabilidade" baseada na
-magnitude da previsão.
+Para facilitar a leitura do resultado no negócio, a execução salva dois
+gráficos PNG em `outputs/model/`: `real_vs_previsto_venda_direta.png` e
+`real_vs_previsto_loja.png`. Cada gráfico mostra as séries de venda real e
+prevista no teste para os 20 SKUs daquele canal (40 combinações SKU-canal no
+total). A previsão pontual é avaliada com WAPE, MAE em unidades e viés.
 
-O pipeline salva em `outputs/model/` um beeswarm SHAP global, três waterfalls
-para previsões representativas e um gráfico previsto-versus-real em painéis por
-SKU-canal. Também retorna a importância SHAP agregada por atributo (incluindo
-SKU, canal e subcategoria), permitindo verificar se a identidade do SKU domina
-as explicações. `best_hyperparameters` contém os parâmetros do estimador
-selecionado, e não de uma busca candidata que tenha perdido.
+O console também mostra SKU_01 como exemplo por canal: WAPE e erro absoluto
+médio em unidades por semana, além de uma estimativa do valor bruto de vendas
+associado ao erro, calculada como a média semanal de
+`|real - previsto| × preco_medio`. Essa conversão é uma proxy para contextualizar
+a escala do erro, não uma estimativa de prejuízo, custo de estoque ou custo de
+ruptura: esses impactos dependem de margem, custos, nível de serviço, lead time
+e decisões de reposição, informações que o CSV não fornece. Se não houver preço
+válido no teste, o valor em reais não é estimado. Como o alvo é venda observada,
+esse exemplo também não recupera a demanda que deixou de ser atendida durante
+rupturas.
+
+`best_hyperparameters` contém os parâmetros do estimador selecionado, e não de
+uma busca candidata que tenha perdido.
