@@ -358,17 +358,6 @@ def preparar_dados_modelo(dados_brutos: pd.DataFrame) -> pd.DataFrame:
         lambda values: values.shift(1).rolling(4).std()
     )
 
-    # Quantidade de ruptura na semana anterior, como sinal de venda possivelmente limitada.
-    previous_stockout = series_groups["qt_ruptura"].shift(1)
-    df["ruptura_defasada_1"] = previous_stockout
-
-    # Indicador binário de ruptura na semana anterior; preserva ausência como NaN.
-    df["flag_ruptura_defasada_1"] = np.where(
-        previous_stockout.isna(),
-        np.nan,
-        previous_stockout.gt(0).astype(int),
-    )
-
     # Seno da semana do ano para representar a sazonalidade sem salto no fim do ano.
     df["semana_seno"] = np.sin(2 * np.pi * semana_iso / 52)
 
@@ -376,8 +365,85 @@ def preparar_dados_modelo(dados_brutos: pd.DataFrame) -> pd.DataFrame:
     df["semana_cosseno"] = np.cos(2 * np.pi * semana_iso / 52)
     return df
 
+
+def preparar_features_semana(
+    historico: pd.DataFrame, linhas_previsao: pd.DataFrame
+) -> pd.DataFrame:
+    """Cria entradas conhecidas para uma semana prevista sem usar seu resultado.
+
+    O histórico pode incluir vendas previstas em chamadas recursivas. Por isso,
+    as mesmas regras de defasagem e janelas móveis servem tanto ao backtest
+    quanto à previsão de produção, sem consultar vendas futuras reais.
+    """
+    required_history = {"sku_id", "canal", "semana", "qt_vendida"}
+    required_forecast = {"sku_id", "canal", "subcategoria_id", "semana"}
+    missing_history = sorted(required_history.difference(historico.columns))
+    missing_forecast = sorted(required_forecast.difference(linhas_previsao.columns))
+    if missing_history or missing_forecast:
+        missing = sorted(set(missing_history + missing_forecast))
+        raise ValueError(
+            "Colunas necessárias ausentes para preparar previsão recursiva: "
+            + ", ".join(missing)
+        )
+    if historico.empty or linhas_previsao.empty:
+        raise ValueError("Histórico e linhas da semana prevista não podem estar vazios.")
+    if historico["semana"].max() >= linhas_previsao["semana"].min():
+        raise ValueError(
+            "O histórico deve terminar antes do início da previsão."
+        )
+
+    history_by_series = {
+        key: group.sort_values("semana")["qt_vendida"].dropna().to_numpy(dtype=float)
+        for key, group in historico.groupby(["sku_id", "canal"], sort=False)
+    }
+
+    feature_rows = []
+    for _, row in linhas_previsao.iterrows():
+        key = (row["sku_id"], row["canal"])
+        quantities = history_by_series.get(key, np.array([], dtype=float))
+        iso_week = int(row["semana"].isocalendar().week)
+        features = {
+            "semana_seno": float(np.sin(2 * np.pi * iso_week / 52)),
+            "semana_cosseno": float(np.cos(2 * np.pi * iso_week / 52)),
+            "venda_defasada_1": (
+                float(quantities[-1]) if len(quantities) >= 1 else np.nan
+            ),
+            "venda_defasada_2": (
+                float(quantities[-2]) if len(quantities) >= 2 else np.nan
+            ),
+            "venda_defasada_4": (
+                float(quantities[-4]) if len(quantities) >= 4 else np.nan
+            ),
+            "venda_defasada_8": (
+                float(quantities[-8]) if len(quantities) >= 8 else np.nan
+            ),
+            "media_movel_4": (
+                float(np.mean(quantities[-4:]))
+                if len(quantities) >= 4
+                else np.nan
+            ),
+            "media_movel_8": (
+                float(np.mean(quantities[-8:]))
+                if len(quantities) >= 8
+                else np.nan
+            ),
+            "desvio_padrao_movel_4": (
+                float(np.std(quantities[-4:], ddof=1))
+                if len(quantities) >= 4
+                else np.nan
+            ),
+            "sku_id": row["sku_id"],
+            "canal": row["canal"],
+            "subcategoria_id": row["subcategoria_id"],
+        }
+        feature_rows.append(features)
+
+    return pd.DataFrame(feature_rows, index=linhas_previsao.index)
+
 ## Opcional: Executa para verificar se o carregamento e preparação funcionam corretamente e exibe o DataFrame resultante usado no modelo. 
 # Remova ou comente esta parte se não for necessária.
+"""
 dados = carregar_dados_vendas()
 df_modelo = preparar_dados_modelo(dados)
 df_modelo
+"""

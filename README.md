@@ -67,9 +67,22 @@ python src\model.py
 ```
 
 `model.py` carrega e prepara os dados antes de treinar e avaliar os modelos.
-A EDA gera os gráficos em `outputs/eda/`.
-O modelo exclui os registros anteriores a 2025-01-01 antes de criar os atributos
-temporais, pois 2024 tem apenas onze semanas observadas e possui comportamento atípico de demanda por SKU quando comparado à demanda de 2025 a 2026.
+A EDA gera os gráficos em `outputs/eda/` e a tabela
+`14_elasticidade_promocional_por_sku.csv`. Ela estima, por SKU, a associação
+entre preço e quantidade vendida em escala log-log, controlando mecânicas
+promocionais, semana ISO do ano e canal. O intervalo de confiança de 95% da
+elasticidade-preço usa bootstrap por semana. A análise considera somente
+semanas sem ruptura, com venda positiva e preço observado plausível; SKUs com
+menos de 20 graus de liberdade residuais são sinalizados como amostra
+insuficiente, em vez de apresentar uma estimativa instável.
+Por exemplo, elasticidade `-0,5` indica que, na amostra analisada, uma alta de
+1% no preço está associada a uma queda aproximada de 0,5% na quantidade vendida.
+
+Esses coeficientes são associações observacionais, não efeitos causais de uma
+promoção. Os efeitos das flags comparam cada mecânica com a ausência daquela
+flag, mantendo os demais fatores do modelo constantes; não estimam o efeito de
+cada ponto percentual adicional de desconto nem um limite ótimo de desconto.
+
 
 ## Modelo e avaliação temporal
 
@@ -78,81 +91,88 @@ demanda estimada somando vendas e ruptura. Os lags e as médias móveis também 
 calculados sobre `qt_vendida`, por SKU e canal, sempre com deslocamento de uma
 semana para não usar a observação que será prevista.
 
+O modelo exclui os registros anteriores a 2025-01-01 antes de criar os atributos
+temporais, pois 2024 tem apenas onze semanas observadas e possui comportamento atípico de demanda por SKU quando comparado à demanda de 2025 a 2026.
+
 São comparados LightGBM e XGBoost. Categorias de SKU, canal e subcategoria são
 codificadas em one-hot. `preparar_dados_modelo`
 faz os tratamentos causais em `src/data_utils.py`: preço, desconto e margem
 ausentes usam histórico disponível, sem recorrer a semanas futuras ou à receita
-da semana prevista. Ausências de ruptura e das variáveis históricas derivadas
-são mantidas como NaN e tratadas nativamente pelos estimadores. As entradas do
-modelo representam histórico de venda (`venda_defasada_*`, `media_movel_*` e
-`desvio_padrao_movel_4`), sazonalidade (`semana_seno` e `semana_cosseno`),
-ruptura anterior, preço e promoção. Preço e mecânicas promocionais precisam ser
-conhecidos antes da previsão (por exemplo, via plano comercial).
+da semana prevista. Para a previsão recursiva de oito semanas, as entradas do
+modelo são SKU, canal, subcategoria, sazonalidade (`semana_seno` e
+`semana_cosseno`) e histórico de venda (`venda_defasada_*`, `media_movel_*` e
+`desvio_padrao_movel_4`). A cada semana do horizonte, lags e médias são
+recalculados com as previsões anteriores do próprio modelo. Preço, promoção e
+ruptura não entram no modelo porque o CSV não fornece seus valores planejados
+para as semanas futuras; incluí-los com os valores realizados criaria
+informação indisponível na data da previsão.
 
-O corte é móvel e se baseia nas semanas presentes no CSV. As 8 semanas finais
-ficam reservadas para teste. As 16 semanas imediatamente anteriores formam a
-janela de validação cruzada, dividida em quatro janelas expansivas e contíguas
-de 4 semanas; todas as semanas dessa janela recebem previsões fora da amostra
-(OOF). Em cada fold, o treino contém todas as semanas anteriores à janela de
-validação, inclusive o histórico anterior ao recorte de validação. O teste não
-participa da seleção nem do ajuste.
+O corte é móvel e usa as semanas presentes no CSV. As oito semanas finais ficam
+reservadas para o teste final. Antes delas, 32 semanas são usadas em validação
+cruzada com quatro origens de previsão: cada bloco tem oito semanas, e o treino
+de cada rodada contém todas as semanas anteriores ao respectivo bloco. Assim,
+o treino cresce de uma rodada para a seguinte.
 
-Primeiro, os modelos padrão são comparados pela WAPE OOF nas 16 semanas (MAE
-como desempate). O vencedor recebe uma busca aleatória simplificada de 12
-combinações de parâmetros próprios daquele modelo. A versão ajustada é comparada
-ao vencedor padrão nos mesmos folds; mantemos a que apresentar menor WAPE.
-O modelo escolhido é ajustado em todas as semanas anteriores ao teste e avaliado
-no teste final.
-O teste tem duração de oito semanas como janela de avaliação — dois ciclos
-mensais de planejamento S&OP, conforme a cadência descrita por Wallace e Stahl
-em *Sales & Operations Planning: The How-To Handbook*, 3ª ed. O horizonte
-operacional do estimador é, porém, uma semana à frente: a cada semana do teste,
-os atributos históricos usam as vendas reais da semana anterior, inclusive
-quando essa semana já faz parte do teste. Portanto, as oito semanas avaliam
-oito previsões sucessivas de uma semana à frente; não simulam oito previsões
-feitas de uma só vez, sem atualização. Como o CSV não informa lead times de fornecedores, a
-janela bimestral é uma escolha de avaliação, não uma afirmação sobre o ciclo real
-de compra; deve ser validada com a área de negócio.
+Em cada bloco, o modelo prevê as oito semanas em sequência. A previsão da
+primeira semana é usada como histórico para prever a segunda, e assim por
+diante; as vendas reais do bloco só são usadas depois para medir os erros. Os
+modelos padrão são comparados pela WAPE agregada das quatro simulações (MAE
+como desempate). A busca aleatória avalia 12 combinações de parâmetros pela
+mesma simulação recursiva. O modelo selecionado é então ajustado com todo o
+histórico anterior ao teste e gera uma única previsão recursiva para as oito
+semanas finais, sem atualização com vendas reais. O teste não participa da
+seleção nem do ajuste.
 
-Os folds respeitam a ordem do tempo: em nenhum deles o treino inclui semanas
-posteriores às semanas de validação. Lags e médias móveis usam somente vendas
-anteriores; os preenchimentos de preço, desconto, margem e subcategoria são
-causais. Assim, não há vazamento temporal direto dessas variáveis. A busca de
-parâmetros e a escolha do modelo reutilizam os mesmos folds, portanto a métrica
-da validação pode ficar otimista por seleção repetida. Isso não expõe o target
-do teste: o teste permanece fora da busca e da escolha e serve como avaliação
-final independente.
+Como o CSV não informa lead times de fornecedores, a janela de oito semanas é
+um horizonte de avaliação, não uma afirmação de que esse seja o prazo real de
+compra; deve ser validada com a área de negócio. Os folds respeitam a ordem do
+tempo e simulam o que estaria disponível na data de cada previsão. A busca de
+parâmetros e a escolha do modelo reutilizam as mesmas janelas, portanto a
+métrica da validação pode ficar otimista por seleção repetida. O teste final
+permanece separado e fornece a avaliação independente.
+
+Preço, promoção e ruptura futura são tratados como desconhecidos e não são
+usados como entradas. Se a operação tiver planos futuros confiáveis para essas
+variáveis, elas poderão ser adicionadas depois e avaliadas sem usar seus valores
+realizados como substitutos.
+
+Como o alvo é venda observada, e não demanda irrestrita, a previsão não corrige
+por uma eventual ruptura futura que ainda não tenha sido informada.
 
 Para facilitar a leitura do resultado no negócio, a execução salva dois
 gráficos PNG em `outputs/model/`: `real_vs_previsto_venda_direta.png` e
 `real_vs_previsto_loja.png`. Cada gráfico mostra as séries de venda real e
 prevista no teste para os 20 SKUs daquele canal (40 combinações SKU-canal no
-total), com uma faixa de incerteza empírica P90.
+total), com uma faixa empírica P90. As previsões incluem o número da semana do
+horizonte (`horizonte`), de 1 a 8.
 
-Para mostrar quanto as previsões podem variar, usamos os erros de previsões
-feitas em semanas passadas que não participaram do treino daquela rodada. O
-cálculo é separado pelo tamanho da previsão: menos de 50, de 50 a 150 e mais
-de 150 unidades.
+Para mostrar quanto as previsões podem variar, usamos os erros das simulações
+recursivas de validação. O erro P90 é calculado separadamente pela posição no
+horizonte (semana 1 a 8) e pelo porte da previsão (menos de 50, de 50 a 150 e
+mais de 150 unidades). Assim, uma previsão distante não herda automaticamente
+o mesmo raio de erro de uma previsão próxima.
 
-`erro_p90_unidades` é um erro de referência em unidades para cada faixa. P90
-significa que, nas semanas usadas para esse cálculo, 90% dos erros absolutos
-ficaram nesse valor ou abaixo dele. Por exemplo, se uma previsão for de 100
-unidades e o erro P90 de sua faixa for 20, mostramos uma faixa de 80 a 120
-unidades (`previsao_inferior` e `previsao_superior`). A previsão inferior nunca
-fica abaixo de zero.
+`erro_p90_unidades` é um erro de referência em unidades para cada combinação de
+semana do horizonte e faixa de volume. P90 significa que, nas simulações usadas
+para esse cálculo, 90% dos erros absolutos ficaram nesse valor ou abaixo dele.
+Por exemplo, se uma previsão for de 100 unidades e o erro P90 daquela semana
+do horizonte e faixa for 20, mostramos uma faixa de 80 a 120 unidades
+(`previsao_inferior` e `previsao_superior`). A previsão inferior nunca fica
+abaixo de zero.
 
-`largura_faixa_pct` mostra o tamanho total dessa faixa comparado com a previsão.
-No exemplo, a faixa vai de 80 a 120: sua largura é 40 unidades, ou 40% da
-previsão de 100. Em geral, um percentual menor significa uma faixa mais estreita
-em relação ao volume previsto. Para uma previsão igual a zero, esse percentual
-não é calculado.
+`largura_faixa_pct` mostra o tamanho total da faixa comparado com a previsão. No
+exemplo, a faixa vai de 80 a 120: sua largura é 40 unidades, ou 40% da previsão
+de 100. Em geral, um percentual menor significa uma faixa mais estreita em
+relação ao volume previsto. Para uma previsão igual a zero, esse percentual não
+é calculado.
 
-A tabela `erro_oof_por_faixa`, retornada com os resultados, mostra o erro P90
-em unidades e quantas previsões passadas foram usadas em cada faixa. Se uma
-faixa não tiver observações, o erro aparece como indefinido; não usamos o erro
-de outra faixa no lugar. Essa faixa é uma referência baseada no histórico, não
-uma garantia de que o valor real ficará dentro dela. A previsão pontual continua
-avaliada com WAPE, MAE em unidades e viés.
+A tabela `erro_oof_por_horizonte_e_faixa`, retornada com os resultados, mostra
+o erro P90 em unidades e a quantidade de observações para cada combinação de
+semana do horizonte e porte da previsão. Se uma combinação não tiver
+observações, o erro fica indefinido; não usamos o erro de outra faixa no lugar.
+Essa faixa é uma referência baseada no histórico, não uma garantia de que o
+valor real ficará dentro dela. O resultado também informa WAPE, MAE e viés por
+semana do horizonte, tanto na validação quanto no teste.
 
 O console também mostra SKU_01 como exemplo por canal: WAPE e erro absoluto
 médio em unidades por semana, além de uma estimativa do valor bruto de vendas

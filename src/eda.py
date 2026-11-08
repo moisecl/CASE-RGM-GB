@@ -6,8 +6,9 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+import statsmodels.formula.api as smf
 if __package__:
-    from .data_utils import (
+    from src.data_utils import (
         EDA_OUTPUT_DIR,
         NUMERIC_COLUMNS,
         carregar_dados_vendas,
@@ -15,7 +16,7 @@ if __package__:
         remover_duplicatas_vendas,
     )
 else:
-    from data_utils import (
+    from src.data_utils import (
         EDA_OUTPUT_DIR,
         NUMERIC_COLUMNS,
         carregar_dados_vendas,
@@ -57,6 +58,161 @@ def save_show(fig, name):
     )
     plt.show()
     plt.close(fig)
+
+
+def estimar_elasticidade_promocional(
+    dados, n_bootstrap=1000, random_state=42
+):
+    """Estima elasticidade-preço por SKU e IC por bootstrap de semanas."""
+    formula = (
+        'np.log(qt_vendida) ~ ln_preco + flag_desconto_direto '
+        '+ flag_combo + flag_pague_e_leve + C(semana_iso) + C(canal)'
+    )
+    resultados = []
+
+    for indice_sku, (sku, grupo) in enumerate(
+        dados.groupby('sku_id', sort=True)
+    ):
+        rng = np.random.default_rng(
+            np.random.SeedSequence([random_state, indice_sku])
+        )
+        amostra = grupo.loc[
+            grupo['_preco_observado_elasticidade']
+            & grupo['qt_ruptura'].eq(0)
+            & grupo['qt_vendida'].gt(0)
+            & grupo['preco_medio'].gt(0)
+        ].copy()
+        colunas_modelo = [
+            'qt_vendida',
+            'preco_medio',
+            'semana_iso',
+            'canal',
+            'semana_dt',
+            'flag_desconto_direto',
+            'flag_combo',
+            'flag_pague_e_leve',
+        ]
+        amostra = amostra.dropna(subset=colunas_modelo).reset_index(drop=True)
+        for coluna in [
+            'flag_desconto_direto',
+            'flag_combo',
+            'flag_pague_e_leve',
+        ]:
+            amostra[coluna] = amostra[coluna].astype(float)
+        amostra['ln_preco'] = np.log(amostra['preco_medio'])
+
+        linha = {'sku_id': sku, 'n_observacoes': len(amostra)}
+        modelo = None
+        if len(amostra) > 0:
+            modelo = smf.ols(formula, data=amostra).fit()
+            matriz = modelo.model.exog
+            coluna_preco = modelo.model.exog_names.index('ln_preco')
+            matriz_sem_preco = np.delete(matriz, coluna_preco, axis=1)
+            preco_identificavel = (
+                np.linalg.matrix_rank(matriz)
+                > np.linalg.matrix_rank(matriz_sem_preco)
+            )
+        else:
+            preco_identificavel = False
+
+        residuos_graus_liberdade = (
+            modelo.df_resid if modelo is not None else 0
+        )
+        linha['graus_liberdade_residuais'] = residuos_graus_liberdade
+        if (
+            modelo is None
+            or not preco_identificavel
+            or residuos_graus_liberdade < 20
+        ):
+            linha.update({
+                'elasticidade_preco': np.nan,
+                'ic95_inferior': np.nan,
+                'ic95_superior': np.nan,
+                'r_quadrado': np.nan,
+                'bootstrap_validos': 0,
+                'status': (
+                    'amostra insuficiente para os efeitos fixos'
+                    if modelo is not None and residuos_graus_liberdade < 20
+                    else 'dados insuficientes ou preço não identificável'
+                ),
+            })
+        else:
+            matriz = modelo.model.exog
+            resposta = modelo.model.endog
+            coluna_preco = modelo.model.exog_names.index('ln_preco')
+            grupos_semana = [
+                indices
+                for indices in amostra.groupby(
+                    'semana_dt', sort=False
+                ).indices.values()
+            ]
+            coeficientes_bootstrap = []
+            for _ in range(n_bootstrap):
+                semanas_sorteadas = rng.integers(
+                    0, len(grupos_semana), size=len(grupos_semana)
+                )
+                indices = np.concatenate(
+                    [grupos_semana[indice] for indice in semanas_sorteadas]
+                )
+                matriz_bootstrap = matriz[indices]
+                matriz_bootstrap_sem_preco = np.delete(
+                    matriz_bootstrap, coluna_preco, axis=1
+                )
+                if (
+                    np.linalg.matrix_rank(matriz_bootstrap)
+                    <= np.linalg.matrix_rank(matriz_bootstrap_sem_preco)
+                ):
+                    continue
+                coeficientes, _, _, _ = np.linalg.lstsq(
+                    matriz_bootstrap, resposta[indices], rcond=None
+                )
+                coeficientes_bootstrap.append(coeficientes[coluna_preco])
+
+            coeficientes_bootstrap = np.asarray(coeficientes_bootstrap)
+            bootstrap_suficiente = (
+                len(coeficientes_bootstrap) >= max(100, 0.8 * n_bootstrap)
+            )
+            linha.update({
+                'elasticidade_preco': modelo.params['ln_preco'],
+                'ic95_inferior': (
+                    np.quantile(coeficientes_bootstrap, 0.025)
+                    if bootstrap_suficiente else np.nan
+                ),
+                'ic95_superior': (
+                    np.quantile(coeficientes_bootstrap, 0.975)
+                    if bootstrap_suficiente else np.nan
+                ),
+                'r_quadrado': modelo.rsquared,
+                'bootstrap_validos': len(coeficientes_bootstrap),
+                'status': (
+                    'estimado' if bootstrap_suficiente
+                    else 'bootstrap insuficiente para IC'
+                ),
+            })
+            for coluna, nome in [
+                ('flag_desconto_direto', 'desconto_direto'),
+                ('flag_combo', 'combo'),
+                ('flag_pague_e_leve', 'pague_e_leve'),
+            ]:
+                coluna_indice = modelo.model.exog_names.index(coluna)
+                flag_identificavel = (
+                    np.linalg.matrix_rank(matriz)
+                    > np.linalg.matrix_rank(
+                        np.delete(matriz, coluna_indice, axis=1)
+                    )
+                )
+                coeficiente = (
+                    modelo.params[coluna]
+                    if flag_identificavel else np.nan
+                )
+                linha[f'efeito_{nome}_pct'] = (
+                    100 * np.expm1(coeficiente)
+                    if pd.notna(coeficiente) else np.nan
+                )
+        resultados.append(linha)
+
+    return pd.DataFrame(resultados)
+
 
 #-------------------------------------------------------------------------------#
 # Qual é o shape, os tipos, o intervalo temporal e a granularidade real?
@@ -367,6 +523,14 @@ print(casos_receita_quantidade)
 
 missing_antes = df.isna().sum()
 subcategorias_antes = df['subcategoria_id'].isna().sum()
+# Marca preços observados e plausíveis antes da imputação, para não estimar
+# elasticidade usando valores preenchidos artificialmente.
+mediana_preco_original_sku = df.groupby('sku_id')['preco_medio'].transform('median')
+df['_preco_observado_elasticidade'] = (
+    df['preco_medio'].notna()
+    & df['preco_medio'].gt(0)
+    & df['preco_medio'].le(5 * mediana_preco_original_sku)
+)
 # Na EDA exploratória, usamos toda a série para descrever/imputar distribuições;
 # esse modo não é apropriado para prever semanas futuras.
 df = preparar_valores_ausentes_vendas(df, causal_imputation=False)
@@ -837,11 +1001,39 @@ plt.tight_layout(rect=[0.04, 0.04, 1, 0.96])
 save_show(fig, '14_loglog_elasticidade')
 
 """
-COMENTÁRIO: A reta é um ajuste linear simples em escala log-log, incluído como
-referência visual. Os Desvios sistemáticos dos pontos em relação à reta sugeream uma relação não-linear
-o que indica uma elasticidade que não é constante para os SKUs analisados no período
-Para uma estimativa de elasticidade para ajudar a entnder a relação preço-demanda, modelos mais robustos e um
-estudo mais apronfudado seria necessário e dessa forma não faz parte do escopo desta análise
+COMENTÁRIO: A regressão abaixo estima uma elasticidade-preço por SKU, controlando
+as mecânicas promocionais, a semana ISO do ano e o canal. O intervalo de confiança
+é calculado por bootstrap, reamostrando semanas completas para preservar juntas
+as observações dos canais na mesma semana. São usadas apenas semanas sem ruptura,
+com venda positiva e preço observado plausível (não imputado).
+"""
+
+# Quantifica a associação entre preço, promoções e quantidade por SKU.
+elasticidade_promocional = estimar_elasticidade_promocional(todos_canais_ok)
+FIGDIR.mkdir(parents=True, exist_ok=True)
+arquivo_elasticidade = FIGDIR / '14_elasticidade_promocional_por_sku.csv'
+elasticidade_promocional.to_csv(arquivo_elasticidade, index=False)
+print('\n--- ELASTICIDADE-PREÇO E EFEITOS PROMOCIONAIS POR SKU ---')
+print(
+    elasticidade_promocional.round(3).to_string(index=False)
+)
+print(f'\nTabela detalhada salva em: {arquivo_elasticidade}')
+
+"""
+COMENTÁRIO: Para o SKU_01, a elasticidade-preço estimada é -0,19: na amostra,
+um aumento de 1% no preço está associado a uma redução aproximada de 0,19% na
+quantidade vendida, mantendo os demais fatores do modelo constantes. Porém, o
+intervalo de confiança de 95% vai de -0,96 a +0,53 e inclui zero; portanto, os
+dados não permitem afirmar com clareza que exista uma relação entre preço e
+vendas para esse SKU.
+
+As flags promocionais do SKU_01 aparecem associadas a vendas cerca de 10,4%
+maiores com desconto direto, 28,5% maiores com combo e 21,9% maiores com
+pague e leve, em comparação à ausência de cada mecânica e mantendo os demais
+fatores constantes. Esses percentuais são associações observadas, não prova de
+que as promoções causaram o aumento; além disso, não temos
+intervalos de confiança para esses efeitos promocionais.
+Para ingerências mais precisas, um teste controlado de mecânica promocional é mais recomendadao
 """
 
 #-------------------------------------------------------------------------------#
@@ -876,6 +1068,7 @@ for subcat, g in df.groupby('subcategoria_id'):
     ax.set_title(f'Correlação de Demanda entre SKUs — {subcat}')
     save_show(fig, f'16_corr_skus_{subcat}')
 
+
 """
 COMENTÁRIO: correlação positiva indica semanas em que as demandas entre os SKUs tendem a
 subir ou cair juntas; correlação negativa indica movimentos opostos. Isso não
@@ -890,6 +1083,41 @@ para os SKUS 14 e 17 (R Pearson = -0.44). Analogamente, os SKUs 15 e 11 da CAT_C
 tiveram a maior correlação positiva (0,80). Possivelmente, SKUs de uso complementar pelo consumidor
 
 """
+# Aprofundamento para o par com maior indício no histórico (SKU 14 e SKU 17)
+focal, vizinho = 'SKU_14', 'SKU_17'
+demanda_semanal = df.pivot_table(
+    index='semana_dt',
+    columns='sku_id',
+    values='demanda_real',
+    aggfunc='mean',
+)
+promo_focal = (
+    df.loc[df['sku_id'].eq(focal)]
+    .groupby('semana_dt')['flag_desconto_direto']
+    .any()
+    .rename('promo_focal')
+)
+comparacao_promo = demanda_semanal[[focal, vizinho]].join(
+    promo_focal,
+    how='inner',
+).dropna()
+dem_promo = comparacao_promo.loc[
+    comparacao_promo['promo_focal'], vizinho
+]
+dem_nao_promo = comparacao_promo.loc[
+    ~comparacao_promo['promo_focal'], vizinho
+]
+print(
+    f'\n{vizinho}: demanda média nas semanas com promoção de {focal} '
+    f'em algum canal = {dem_promo.mean():.1f} '
+    f'(n={len(dem_promo)} semanas)'
+)
+print(
+    f'{vizinho}: demanda média nas semanas sem promoção de {focal} '
+    f'em qualquer canal = {dem_nao_promo.mean():.1f} '
+    f'(n={len(dem_nao_promo)} semanas)'
+)
+
 
 #-------------------------------------------------------------------------------#
 # Os dois canais têm a mesma distribuição de demanda, desconto, ruptura?

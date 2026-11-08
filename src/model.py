@@ -1,14 +1,15 @@
-"""Compara e avalia modelos de venda semanal com validação temporal.
+"""Treina, seleciona e avalia previsões recursivas de vendas para oito semanas.
 
-O modelo gera previsões de uma semana à frente. As oito semanas finais são
-reservadas para avaliar essa previsão semanal em sequência, atualizando os
-atributos históricos com as vendas reais da semana anterior; não representam
-uma previsão única de oito semanas à frente.
+LightGBM e XGBoost são comparados em quatro janelas temporais de validação,
+cada uma simulando oito semanas à frente sem consultar as vendas reais dentro
+do horizonte. Os lags e as médias móveis são atualizados com as próprias
+previsões. Preço, promoção e ruptura futura não são usados, pois não há planos
+futuros disponíveis para esses dados.
 
-Antes do teste, LightGBM e XGBoost são comparados em 16 semanas de validação
-cruzada temporal. O modelo vencedor pode receber ajuste de hiperparâmetros e,
-em seguida, é treinado com todos os dados anteriores às oito semanas finais.
-Essas semanas finais não participam da seleção nem do ajuste.
+Após a seleção e o ajuste de parâmetros, o modelo é treinado com todo o período
+anterior às oito semanas finais e avaliado nessas semanas, também de forma
+recursiva. Assim, o teste representa uma única previsão de oito semanas, e não
+oito previsões semanais atualizadas com vendas reais.
 
 Modelos:
 * LightGBM: rápido e eficiente em dados tabulares; modelos muito complexos
@@ -30,34 +31,39 @@ from lightgbm import LGBMRegressor
 from sklearn.base import BaseEstimator, clone
 from sklearn.compose import ColumnTransformer
 from sklearn.metrics import mean_absolute_error
-from sklearn.model_selection import RandomizedSearchCV
+from sklearn.model_selection import ParameterSampler
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 from xgboost import XGBRegressor
 
 if __package__:
-    from src.data_utils import carregar_dados_vendas, preparar_dados_modelo
+    from src.data_utils import (
+        carregar_dados_vendas,
+        preparar_dados_modelo,
+        preparar_features_semana,
+    )
 else:
-    from src.data_utils import carregar_dados_vendas, preparar_dados_modelo
+    from src.data_utils import (
+        carregar_dados_vendas,
+        preparar_dados_modelo,
+        preparar_features_semana,
+    )
 
 
 TARGET = "qt_vendida"
-CV_WEEKS = 16
-FOLD_WEEKS = 4
+CV_FOLDS = 4
+FORECAST_HORIZON_WEEKS = 8
+CV_WEEKS = CV_FOLDS * FORECAST_HORIZON_WEEKS
+FOLD_WEEKS = FORECAST_HORIZON_WEEKS
 TEST_WEEKS = 8
+MIN_TRAIN_WEEKS = 8
 RANDOM_STATE = 42
 RANDOM_SEARCH_ITERATIONS = 12
 PREDICTION_BUCKETS = ("<50", "50-150", ">150")
 ERROR_QUANTILE = 0.90
 MODEL_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "outputs" / "model"
 
-# Preço e mecânicas promocionais precisam ser conhecidos no momento da previsão.
 NUMERIC_FEATURES = [
-    "preco_medio",
-    "desconto_pct",
-    "flag_desconto_direto",
-    "flag_combo",
-    "flag_pague_e_leve",
     "semana_seno",
     "semana_cosseno",
     "venda_defasada_1",
@@ -67,19 +73,12 @@ NUMERIC_FEATURES = [
     "media_movel_4",
     "media_movel_8",
     "desvio_padrao_movel_4",
-    "ruptura_defasada_1",
-    "flag_ruptura_defasada_1",
 ]
 CATEGORICAL_FEATURES = ["sku_id", "canal", "subcategoria_id"]
 FEATURES = NUMERIC_FEATURES + CATEGORICAL_FEATURES
 
 # Dicionário para tornar a entrada do modelo compreensível e auditável.
 FEATURE_DESCRIPTIONS = {
-    "preco_medio": "Preço médio da semana; deve ser conhecido antes da previsão.",
-    "desconto_pct": "Percentual de desconto planejado para a semana.",
-    "flag_desconto_direto": "Indica promoção de desconto direto.",
-    "flag_combo": "Indica participação em promoção do tipo combo.",
-    "flag_pague_e_leve": "Indica promoção do tipo pague e leve.",
     "semana_seno": "Componente seno que representa a posição cíclica da semana no ano.",
     "semana_cosseno": "Componente cosseno que representa a posição cíclica da semana no ano.",
     "venda_defasada_1": "Quantidade vendida na semana anterior para o mesmo SKU e canal.",
@@ -89,8 +88,6 @@ FEATURE_DESCRIPTIONS = {
     "media_movel_4": "Média das quatro quantidades anteriores, sem incluir a semana prevista.",
     "media_movel_8": "Média das oito quantidades anteriores, sem incluir a semana prevista.",
     "desvio_padrao_movel_4": "Desvio padrão das vendas nas quatro semanas anteriores.",
-    "ruptura_defasada_1": "Quantidade em ruptura na semana anterior.",
-    "flag_ruptura_defasada_1": "Indica se houve ruptura na semana anterior.",
     "sku_id": "Identificador do SKU, codificado como categoria.",
     "canal": "Canal de venda, codificado como categoria.",
     "subcategoria_id": "Identificador da subcategoria, codificado como categoria.",
@@ -269,8 +266,8 @@ def _period_description(frame: pd.DataFrame) -> str:
 
 def _make_temporal_folds(
     frame: pd.DataFrame, weeks: pd.Index
-) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Cria folds expansivos contíguos que cobrem todas as semanas de CV."""
+) -> list[tuple[np.ndarray, pd.Index]]:
+    """Cria quatro origens de validação, cada uma com horizonte de oito semanas."""
     if FOLD_WEEKS <= 0 or CV_WEEKS % FOLD_WEEKS:
         raise ValueError("CV_WEEKS deve ser divisível por FOLD_WEEKS.")
 
@@ -287,9 +284,6 @@ def _make_temporal_folds(
         validation_dates = weeks[start : start + FOLD_WEEKS]
         train_dates = all_weeks[all_weeks < validation_dates.min()]
         train_indices = np.flatnonzero(frame["semana"].isin(train_dates))
-        validation_indices = np.flatnonzero(
-            frame["semana"].isin(validation_dates)
-        )
         if not len(train_indices):
             raise ValueError("O fold temporal não contém semanas de treino.")
         if train_dates.max() >= validation_dates.min():
@@ -298,34 +292,76 @@ def _make_temporal_folds(
             raise ValueError(
                 f"O fold não contém exatamente {FOLD_WEEKS} semanas."
             )
-        folds.append((train_indices, validation_indices))
+        folds.append((train_indices, validation_dates))
     return folds
 
 
-def _negative_wape(
-    estimator: Pipeline, features: pd.DataFrame, actual: pd.Series
-) -> float:
-    """Pontua a busca pelo negativo da WAPE em todas as linhas."""
-    predicted = np.clip(estimator.predict(features), 0, None)
-    return -_metrics(actual, predicted)["wape"]
+def _forecast_recursively(
+    pipeline: Pipeline,
+    history: pd.DataFrame,
+    forecast_rows: pd.DataFrame,
+) -> pd.DataFrame:
+    """Prevê semanas futuras em sequência, usando previsões como histórico."""
+    forecast_weeks = pd.Index(
+        forecast_rows["semana"].drop_duplicates().sort_values()
+    )
+    if len(forecast_weeks) != FORECAST_HORIZON_WEEKS:
+        raise ValueError(
+            "A previsão recursiva deve conter exatamente "
+            f"{FORECAST_HORIZON_WEEKS} semanas."
+        )
+    if not (
+        forecast_weeks.to_series().diff().dropna().dt.days.eq(7).all()
+    ):
+        raise ValueError("O horizonte de previsão deve conter semanas contíguas.")
+
+    working_history = history[["sku_id", "canal", "semana", TARGET]].copy()
+    results = []
+    for horizon, week in enumerate(forecast_weeks, 1):
+        week_rows = forecast_rows.loc[forecast_rows["semana"] == week].copy()
+        week_features = preparar_features_semana(working_history, week_rows)
+        prediction = np.clip(
+            pipeline.predict(week_features[FEATURES]), 0, None
+        )
+        result_columns = ["semana", "sku_id", "canal"]
+        if TARGET in week_rows:
+            result_columns.append(TARGET)
+        if "preco_medio" in week_rows:
+            result_columns.append("preco_medio")
+        week_result = week_rows[result_columns].copy()
+        week_result["previsao"] = prediction
+        week_result["horizonte"] = horizon
+        results.append(week_result)
+
+        predicted_history = week_rows[["sku_id", "canal", "semana"]].copy()
+        predicted_history[TARGET] = prediction
+        working_history = pd.concat(
+            [working_history, predicted_history], ignore_index=True
+        )
+
+    return pd.concat(results).sort_values(["semana", "sku_id", "canal"])
 
 
-def _evaluate_model(
+def _evaluate_recursive_model(
     estimator: BaseEstimator,
+    frame: pd.DataFrame,
     features: pd.DataFrame,
     target: pd.Series,
-    folds: list[tuple[np.ndarray, np.ndarray]],
-) -> tuple[dict[str, float], dict[str, float]]:
-    """Avalia o modelo nos folds temporais e calcula métricas OOF agregadas."""
-    train_wapes = []
-    validation_targets = []
+    folds: list[tuple[np.ndarray, pd.Index]],
+) -> tuple[dict[str, float], dict[str, object], pd.DataFrame]:
+    """Avalia cada fold prevendo recursivamente todo o horizonte de oito semanas."""
+    train_targets = []
+    train_predictions = []
     validation_predictions = []
 
-    for train_indices, validation_indices in folds:
+    for train_indices, validation_weeks in folds:
         x_train = features.iloc[train_indices]
         y_train = target.iloc[train_indices]
-        x_validation = features.iloc[validation_indices]
-        if x_train.empty or x_validation.empty:
+        history = frame.iloc[train_indices]
+        forecast_rows = frame.loc[
+            frame["semana"].isin(validation_weeks)
+        ]
+        if x_train.empty or forecast_rows.empty:
             raise ValueError("Fold temporal sem linhas de treino ou validação.")
 
         pipeline = _make_pipeline(estimator)
@@ -333,22 +369,30 @@ def _evaluate_model(
         train_prediction = np.clip(
             pipeline.predict(x_train), 0, None
         )
-        validation_prediction = np.clip(
-            pipeline.predict(x_validation), 0, None
+        train_targets.append(y_train)
+        train_predictions.append(train_prediction)
+        validation_predictions.append(
+            _forecast_recursively(pipeline, history, forecast_rows)
         )
-        train_wapes.append(
-            _metrics(y_train, train_prediction)["wape"]
-        )
-        validation_targets.append(target.iloc[validation_indices])
-        validation_predictions.append(validation_prediction)
 
-    scores = _metrics(
-        pd.concat(validation_targets),
-        np.concatenate(validation_predictions),
+    oof_predictions = pd.concat(validation_predictions).sort_index()
+    cross_validation_scores = _metrics(
+        oof_predictions[TARGET],
+        oof_predictions["previsao"].to_numpy(),
     )
+    cross_validation_scores["por_horizonte"] = {
+        int(horizon): _metrics(
+            group[TARGET], group["previsao"].to_numpy()
+        )
+        for horizon, group in oof_predictions.groupby("horizonte", sort=True)
+    }
     return (
-        {"wape": float(np.mean(train_wapes))},
-        scores,
+        _metrics(
+            pd.concat(train_targets),
+            np.concatenate(train_predictions),
+        ),
+        cross_validation_scores,
+        oof_predictions,
     )
 
 
@@ -369,77 +413,45 @@ def _prediction_buckets(predictions: pd.Series) -> pd.Series:
     )
 
 
-def _collect_oof_predictions(
-    estimator: BaseEstimator,
-    features: pd.DataFrame,
-    target: pd.Series,
-    folds: list[tuple[np.ndarray, np.ndarray]],
-) -> pd.DataFrame:
-    """Gera previsões OOF do estimador selecionado para calibrar os erros."""
-    predictions = []
-    for train_indices, validation_indices in folds:
-        x_train = features.iloc[train_indices]
-        x_validation = features.iloc[validation_indices]
-        y_train = target.iloc[train_indices]
-        if x_train.empty or x_validation.empty:
-            raise ValueError("Fold temporal sem linhas de treino ou validação.")
-
-        pipeline = _make_pipeline(clone(estimator))
-        pipeline.fit(x_train, y_train)
-        validation_prediction = np.clip(
-            pipeline.predict(x_validation), 0, None
-        )
-        validation_target = target.iloc[validation_indices]
-        predictions.append(
-            pd.DataFrame(
-                {
-                    "real": validation_target.to_numpy(),
-                    "previsao": validation_prediction,
-                },
-                index=validation_target.index,
-            )
-        )
-
-    if not predictions:
-        raise ValueError("Não há folds para calcular os erros OOF.")
-    oof_predictions = pd.concat(predictions).sort_index()
-    if oof_predictions.index.has_duplicates:
-        raise ValueError("Uma observação foi prevista em mais de um fold OOF.")
-    return oof_predictions
-
-
 def _oof_error_by_bucket(oof_predictions: pd.DataFrame) -> pd.DataFrame:
-    """Calcula o quantil P90 do erro absoluto OOF por faixa de previsão."""
+    """Calcula o erro P90 por semana do horizonte e porte da previsão."""
     buckets = _prediction_buckets(oof_predictions["previsao"])
     absolute_errors = (
-        oof_predictions["real"] - oof_predictions["previsao"]
+        oof_predictions[TARGET] - oof_predictions["previsao"]
     ).abs()
     summary = []
-    for bucket in PREDICTION_BUCKETS:
-        errors = absolute_errors.loc[buckets == bucket]
-        summary.append(
-            {
-                "faixa_previsao": bucket,
-                "quantidade_oof": len(errors),
-                "erro_p90_unidades": (
-                    float(errors.quantile(ERROR_QUANTILE))
-                    if not errors.empty
-                    else float("nan")
-                ),
-            }
-        )
-    return pd.DataFrame(summary).set_index("faixa_previsao")
+    for horizon in range(1, FORECAST_HORIZON_WEEKS + 1):
+        for bucket in PREDICTION_BUCKETS:
+            mask = oof_predictions["horizonte"].eq(horizon) & buckets.eq(bucket)
+            errors = absolute_errors.loc[mask]
+            summary.append(
+                {
+                    "horizonte": horizon,
+                    "faixa_previsao": bucket,
+                    "quantidade_oof": len(errors),
+                    "erro_p90_unidades": (
+                        float(errors.quantile(ERROR_QUANTILE))
+                        if not errors.empty
+                        else float("nan")
+                    ),
+                }
+            )
+    return pd.DataFrame(summary).set_index(["horizonte", "faixa_previsao"])
 
 
 def _add_prediction_intervals(
     predictions: pd.DataFrame, error_by_bucket: pd.DataFrame
 ) -> pd.DataFrame:
-    """Anexa faixa empírica P90 e sua largura relativa à previsão."""
+    """Anexa faixa P90 calibrada por horizonte e porte da previsão."""
     result = predictions.copy()
     prediction_buckets = _prediction_buckets(result["previsao"])
-    result["erro_p90_unidades"] = prediction_buckets.map(
-        error_by_bucket["erro_p90_unidades"]
+    calibration_keys = pd.MultiIndex.from_arrays(
+        [result["horizonte"], prediction_buckets],
+        names=["horizonte", "faixa_previsao"],
     )
+    result["erro_p90_unidades"] = error_by_bucket[
+        "erro_p90_unidades"
+    ].reindex(calibration_keys).to_numpy()
     result["previsao_inferior"] = (
         result["previsao"] - result["erro_p90_unidades"]
     ).clip(lower=0)
@@ -460,31 +472,38 @@ def _add_prediction_intervals(
 def _random_search_best_model(
     model_name: str,
     estimator: BaseEstimator,
+    frame: pd.DataFrame,
     features: pd.DataFrame,
     target: pd.Series,
-    folds: list[tuple[np.ndarray, np.ndarray]],
-) -> tuple[BaseEstimator, dict[str, object], float]:
-    """Ajusta por busca aleatória apenas o modelo que venceu a validação."""
+    folds: list[tuple[np.ndarray, pd.Index]],
+) -> tuple[
+    BaseEstimator,
+    dict[str, object],
+    dict[str, float],
+    dict[str, object],
+    pd.DataFrame,
+]:
+    """Busca parâmetros avaliando cada opção no horizonte recursivo completo."""
     parameter_spaces = {
         "LightGBM": {
-            "model__n_estimators": [100, 200, 300, 500],
-            "model__learning_rate": [0.03, 0.05, 0.1],
-            "model__num_leaves": [15, 31, 63],
-            "model__max_depth": [-1, 5, 10],
-            "model__min_child_samples": [10, 20, 40],
-            "model__subsample": [0.7, 0.85, 1.0],
-            "model__subsample_freq": [1, 5],
-            "model__colsample_bytree": [0.7, 0.85, 1.0],
-            "model__reg_lambda": [0, 1, 3],
+            "n_estimators": [100, 200, 300, 500],
+            "learning_rate": [0.03, 0.05, 0.1],
+            "num_leaves": [15, 31, 63],
+            "max_depth": [-1, 5, 10],
+            "min_child_samples": [10, 20, 40],
+            "subsample": [0.7, 0.85, 1.0],
+            "subsample_freq": [1, 5],
+            "colsample_bytree": [0.7, 0.85, 1.0],
+            "reg_lambda": [0, 1, 3],
         },
         "XGBoost": {
-            "model__n_estimators": [100, 200, 300, 500],
-            "model__max_depth": [3, 4, 6],
-            "model__learning_rate": [0.03, 0.05, 0.1, 0.3],
-            "model__subsample": [0.7, 0.85, 1.0],
-            "model__colsample_bytree": [0.7, 0.85, 1.0],
-            "model__min_child_weight": [1, 3, 5],
-            "model__reg_lambda": [1, 3, 5],
+            "n_estimators": [100, 200, 300, 500],
+            "max_depth": [3, 4, 6],
+            "learning_rate": [0.03, 0.05, 0.1, 0.3],
+            "subsample": [0.7, 0.85, 1.0],
+            "colsample_bytree": [0.7, 0.85, 1.0],
+            "min_child_weight": [1, 3, 5],
+            "reg_lambda": [1, 3, 5],
         },
     }
     if model_name not in parameter_spaces:
@@ -493,29 +512,49 @@ def _random_search_best_model(
         # Desativa somente as mensagens internas durante as muitas tentativas.
         estimator.set_params(verbosity=-1)
 
-    search = RandomizedSearchCV(
-        estimator=_make_pipeline(estimator),
-        param_distributions=parameter_spaces[model_name],
+    sampled_parameters = ParameterSampler(
+        parameter_spaces[model_name],
         n_iter=RANDOM_SEARCH_ITERATIONS,
-        scoring=_negative_wape,
-        cv=folds,
-        refit=False,
         random_state=RANDOM_STATE,
-        n_jobs=1,
-        error_score="raise",
     )
-    search.fit(features, target)
-    best_model = clone(estimator)
-    model_parameters = {
-        key.removeprefix("model__"): value
-        for key, value in search.best_params_.items()
-    }
-    best_model.set_params(**model_parameters)
-    return best_model, search.best_params_, float(-search.best_score_)
+    best_model = None
+    best_parameters = {}
+    best_train_scores = {}
+    best_cv_scores = {}
+    best_predictions = pd.DataFrame()
+    for parameters in sampled_parameters:
+        candidate = clone(estimator).set_params(**parameters)
+        train_scores, cv_scores, oof_predictions = _evaluate_recursive_model(
+            candidate, frame, features, target, folds
+        )
+        candidate_score = (
+            cv_scores["wape"],
+            cv_scores["mae"],
+        )
+        best_score = (
+            best_cv_scores.get("wape", float("inf")),
+            best_cv_scores.get("mae", float("inf")),
+        )
+        if candidate_score < best_score:
+            best_model = candidate
+            best_parameters = parameters
+            best_train_scores = train_scores
+            best_cv_scores = cv_scores
+            best_predictions = oof_predictions
+
+    if best_model is None:
+        raise ValueError(f"Nenhuma configuração avaliada para {model_name}.")
+    return (
+        best_model,
+        best_parameters,
+        best_train_scores,
+        best_cv_scores,
+        best_predictions,
+    )
 
 
 def run_model(df: pd.DataFrame) -> dict[str, object]:
-    """Seleciona, ajusta e testa modelos com validação cruzada temporal."""
+    """Seleciona, ajusta e testa modelos em previsões recursivas de oito semanas."""
     missing_columns = sorted(set(FEATURES + [TARGET, "semana"]) - set(df.columns))
     if missing_columns:
         raise ValueError(
@@ -529,10 +568,12 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         .reset_index(drop=True)
     )
     weeks = pd.Index(data["semana"].drop_duplicates().sort_values())
-    required_weeks = CV_WEEKS + TEST_WEEKS + 1
+    required_weeks = MIN_TRAIN_WEEKS + CV_WEEKS + TEST_WEEKS
     if len(weeks) < required_weeks:
         raise ValueError(
-            f"São necessárias ao menos {required_weeks} semanas; "
+            f"São necessárias ao menos {required_weeks} semanas "
+            f"({MIN_TRAIN_WEEKS} de treino inicial, {CV_WEEKS} de validação "
+            f"e {TEST_WEEKS} de teste); "
             f"foram encontradas {len(weeks)}."
         )
 
@@ -544,24 +585,34 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
     )
     test = data.loc[data["semana"].isin(test_weeks)].copy()
     folds = _make_temporal_folds(pre_test, cv_weeks)
-    expected_folds = CV_WEEKS // FOLD_WEEKS
-    if len(folds) != expected_folds:
+    if len(folds) != CV_FOLDS:
         raise ValueError("Não foi possível formar os folds temporais esperados.")
 
     print(f"Alvo previsto: {TARGET}")
     print(
-        f"Validação cruzada: janela expansiva de {CV_WEEKS} semanas, "
-        f"com {len(folds)} blocos contíguos de {FOLD_WEEKS} semanas."
+        f"Validação cruzada: {len(folds)} origens de previsão, "
+        f"cada uma com horizonte recursivo de {FORECAST_HORIZON_WEEKS} "
+        "semanas."
     )
-    for fold_index, (train_indices, validation_indices) in enumerate(folds, 1):
+    for fold_index, (train_indices, validation_period) in enumerate(folds, 1):
         fold_train = pre_test.iloc[train_indices]
-        fold_validation = pre_test.iloc[validation_indices]
+        fold_validation = pre_test.loc[
+            pre_test["semana"].isin(validation_period)
+        ]
         print(
-            f"Fold {fold_index}: treino {_period_description(fold_train)}; "
-            f"validação {_period_description(fold_validation)}."
+            f"Validação {fold_index}: treino até "
+            f"{fold_train['semana'].max():%Y-%m-%d}; "
+            f"horizonte {_period_description(fold_validation)}."
         )
-    print(f"Teste final intocado: {_period_description(test)}")
-    print("NaN numéricos são tratados nativamente pelos modelos de boosting.")
+    print(
+        f"Teste final recursivo, sem atualizar com vendas reais: "
+        f"{_period_description(test)}"
+    )
+    print(
+        "Features futuras: calendário, SKU, canal, subcategoria e histórico "
+        "de vendas previsto recursivamente; preço, promoção e ruptura futura "
+        "não são usados."
+    )
 
     features = pre_test[FEATURES]
     target = pre_test[TARGET]
@@ -570,22 +621,33 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         "XGBoost": XGBRegressor(random_state=RANDOM_STATE),
     }
     model_results = {}
+    recursive_evaluations = {}
 
     print("\nComparação dos modelos padrão nos folds temporais:")
     for name, estimator in candidates.items():
-        train_scores, cv_scores = _evaluate_model(
-            estimator, features, target, folds
+        train_scores, cv_scores, oof_predictions = _evaluate_recursive_model(
+            estimator, pre_test, features, target, folds
+        )
+        recursive_evaluations[name] = (
+            train_scores,
+            cv_scores,
+            oof_predictions,
         )
         model_results[name] = {
             "train": train_scores,
             "cross_validation": cv_scores,
         }
         print(
-            f"{name:16s} | erro treino: {train_scores['wape']:.2%} "
-            f"| WAPE Out of Folds nas {CV_WEEKS} semanas: {cv_scores['wape']:.2%} "
+            f"{name:16s} | WAPE recursiva OOF em "
+            f"{CV_WEEKS} semanas: {cv_scores['wape']:.2%} "
             f"| Erro médio (MAE): {cv_scores['mae']:.2f} unidades "
             f"| Tendência a super/subestimar (BIAS): {cv_scores['bias']:.2%}"
         )
+        for horizon, horizon_scores in cv_scores["por_horizonte"].items():
+            print(
+                f"  Semana {horizon}: WAPE {horizon_scores['wape']:.2%}; "
+                f"MAE {horizon_scores['mae']:.2f} un."
+            )
 
     # Escolhe primeiro entre modelos padrão; o teste não participa da decisão.
     initial_winner = min(
@@ -599,25 +661,43 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
 
     print(
         f"\nBusca aleatória de {initial_winner}: "
-        f"{RANDOM_SEARCH_ITERATIONS} combinações nos folds temporais."
+        f"{RANDOM_SEARCH_ITERATIONS} combinações, avaliadas em previsões "
+        "recursivas de oito semanas."
     )
-    tuned_estimator, best_parameters, search_cv_wape = (
+    (
+        tuned_estimator,
+        best_parameters,
+        tuned_train_scores,
+        tuned_cv_scores,
+        tuned_oof_predictions,
+    ) = (
         _random_search_best_model(
             initial_winner,
             candidates[initial_winner],
+            pre_test,
             features,
             target,
             folds,
         )
     )
-    tuned_train_scores, tuned_cv_scores = _evaluate_model(
-        tuned_estimator, features, target, folds
+    recursive_evaluations[f"{initial_winner} ajustado"] = (
+        tuned_train_scores,
+        tuned_cv_scores,
+        tuned_oof_predictions,
     )
-    print(f"Menor erro médio encontrado na busca: {search_cv_wape:.2%}")
     print(
-        f"WAPE Out of Folds de {initial_winner} ajustado nas {CV_WEEKS} semanas: "
+        "Menor WAPE recursiva encontrado na busca: "
         f"{tuned_cv_scores['wape']:.2%}"
     )
+    print(
+        f"WAPE recursiva OOF do {initial_winner} ajustado nas "
+        f"{CV_WEEKS} semanas: {tuned_cv_scores['wape']:.2%}"
+    )
+    for horizon, horizon_scores in tuned_cv_scores["por_horizonte"].items():
+        print(
+            f"  Semana {horizon}: WAPE {horizon_scores['wape']:.2%}; "
+            f"MAE {horizon_scores['mae']:.2f} un."
+        )
     parameter_names = {
         "n_estimators": "quantidade de árvores",
         "max_depth": "profundidade máxima",
@@ -631,10 +711,10 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         "num_leaves": "máximo de folhas",
     }
     readable_parameters = {
-        parameter_names.get(key.removeprefix("model__"), key): value
+        parameter_names.get(key, key): value
         for key, value in best_parameters.items()
     }
-    print(f"Configuração escolhida (nomes simplificados): {readable_parameters}")
+    print(f"Melhor configuração da busca: {readable_parameters}")
 
     tuned_name = f"{initial_winner} ajustado"
     model_results[tuned_name] = {
@@ -649,25 +729,28 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
             model_results[name]["cross_validation"]["mae"],
         ),
     )
+    selected_parameters = (
+        best_parameters if selected_name == tuned_name else {}
+    )
     print(f"\nModelo selecionado após o ajuste: {selected_name}")
-
-    if selected_name == tuned_name:
-        selected_pipeline = _make_pipeline(tuned_estimator)
+    if selected_name == initial_winner:
+        print("A configuração padrão superou a melhor configuração ajustada.")
     else:
-        selected_pipeline = _make_pipeline(candidates[initial_winner])
+        print(f"Configuração selecionada: {readable_parameters}")
 
     selected_estimator = (
         tuned_estimator
         if selected_name == tuned_name
         else candidates[initial_winner]
     )
-    oof_predictions = _collect_oof_predictions(
-        selected_estimator, features, target, folds
+    selected_pipeline = _make_pipeline(clone(selected_estimator))
+    _, selected_cv_scores, oof_predictions = (
+        recursive_evaluations[selected_name]
     )
     error_by_bucket = _oof_error_by_bucket(oof_predictions)
     print(
-        f"\nErro absoluto P{ERROR_QUANTILE:.0%} por faixa de previsão "
-        f"(unidades):\n"
+        f"\nErro absoluto P{ERROR_QUANTILE:.0%} por semana do horizonte e "
+        f"faixa de previsão (unidades):\n"
         + error_by_bucket.to_string(
             formatters={
                 "erro_p90_unidades": lambda value: f"{value:.2f}"
@@ -681,11 +764,14 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
     train_prediction = np.clip(
         selected_pipeline.predict(pre_test[FEATURES]), 0, None
     )
-    train_scores = _metrics(pre_test[TARGET], train_prediction)
+    train_one_step_scores = _metrics(
+        pre_test[TARGET], train_prediction
+    )
 
-    predictions = test.copy()
-    predictions["previsao"] = np.clip(
-        selected_pipeline.predict(test[FEATURES]), 0, None
+    predictions = _forecast_recursively(
+        selected_pipeline,
+        pre_test[["sku_id", "canal", "semana", TARGET]],
+        test,
     )
     predictions = _add_prediction_intervals(predictions, error_by_bucket)
 
@@ -693,21 +779,32 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         test[TARGET],
         predictions["previsao"].to_numpy(),
     )
+    test_scores["por_horizonte"] = {
+        int(horizon): _metrics(
+            group[TARGET], group["previsao"].to_numpy()
+        )
+        for horizon, group in predictions.groupby("horizonte", sort=True)
+    }
     chart_paths = _save_test_forecast_charts(predictions)
 
     print("\nResultado final do modelo selecionado:")
     print(f"Modelo: {selected_name}")
     print(f"Período usado para ajuste final: {_period_description(pre_test)}")
     print(
-        f"Treino | erro percentual: {train_scores['wape']:.2%} "
-        f"| Erro médio (MAE): {train_scores['mae']:.2f} unidades "
-        f"| Tendência a super/subestimar (BIAS): {train_scores['bias']:.2%}"
+        "Referência de treino a uma semana (não recursiva) | "
+        f"WAPE: {train_one_step_scores['wape']:.2%} "
+        f"| MAE: {train_one_step_scores['mae']:.2f} unidades"
     )
     print(
-        f"Teste  | erro percentual: {test_scores['wape']:.2%} "
+        f"Teste recursivo | WAPE: {test_scores['wape']:.2%} "
         f"| Erro médio (MAE): {test_scores['mae']:.2f} unidades "
         f"| Tendência a super/subestimar (BIAS): {test_scores['bias']:.2%}"
     )
+    for horizon, horizon_scores in test_scores["por_horizonte"].items():
+        print(
+            f"  Semana {horizon}: WAPE {horizon_scores['wape']:.2%}; "
+            f"MAE {horizon_scores['mae']:.2f} un."
+        )
     print("Gráficos real vs. previsto por SKU-canal:")
     for channel, chart_path in chart_paths.items():
         print(f"  {channel}: {chart_path}")
@@ -716,6 +813,7 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         "semana",
         "sku_id",
         "canal",
+        "horizonte",
         TARGET,
         "previsao",
         "erro_p90_unidades",
@@ -731,14 +829,14 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         "model_name": selected_name,
         "predictions": predictions,
         "metrics": {
-            "train": train_scores,
-            "cross_validation": model_results[selected_name]["cross_validation"],
+            "train_one_step_reference": train_one_step_scores,
+            "cross_validation": selected_cv_scores,
             "test": test_scores,
             **test_scores,
         },
         "model_comparison": model_results,
-        "best_hyperparameters": best_parameters,
-        "erro_oof_por_faixa": error_by_bucket,
+        "best_hyperparameters": selected_parameters,
+        "erro_oof_por_horizonte_e_faixa": error_by_bucket,
         "feature_descriptions": FEATURE_DESCRIPTIONS,
         "periods": {
             "cross_validation": _period_description(
