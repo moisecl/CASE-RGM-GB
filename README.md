@@ -128,7 +128,7 @@ O resultado apresenta WAPE, MAE e BIAS:
 As métricas são apresentadas para validação e teste; WAPE e MAE também são
 detalhadas por semana do horizonte. O console inclui ainda um exemplo de
 tradução do erro do SKU_01 por canal. A conversão para reais usa
-`|real - previsto| × preco_medio` como proxy de valor bruto associado ao erro;
+`|real - previsto| × preco_medio` como aproximação de valor bruto associado ao erro;
 não é uma estimativa de prejuízo, custo de estoque ou custo de ruptura.
 
 Para explicar previsões individuais, são salvos dois gráficos SHAP Waterfall:
