@@ -223,6 +223,3 @@ corrige por uma ruptura futura ainda não informada.
   uma saída-base mais contribuições positivas e negativas das variáveis.
 - **NaN**: valor ausente. Os modelos de árvore usados aqui tratam valores
   numéricos ausentes diretamente.
-
-`best_hyperparameters` contém os parâmetros do estimador selecionado; não
-retorna parâmetros de uma configuração candidata que tenha perdido a seleção.
