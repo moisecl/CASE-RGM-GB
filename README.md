@@ -1,189 +1,228 @@
 # Case RGM
 
-## Estrutura
+## Visão geral
 
-- `data/vendas_sku_semanal.csv`: dados de entrada.
-- `src/data_utils.py`: caminhos, carregamento e preparação compartilhada.
-- `src/eda.py`: análise exploratória; salva gráficos em `outputs/eda/`.
-- `src/model.py`: treinamento, avaliação e interpretação do modelo.
+Este projeto analisa vendas semanais por SKU e canal e compara modelos para
+prever a quantidade vendida nas oito semanas seguintes. A análise exploratória
+investiga sazonalidade, rupturas, promoções, elasticidade-preço e relações entre
+SKUs. A modelagem usa validação temporal, previsão recursiva e uma faixa
+empírica de erro para comunicar a incerteza das previsões.
 
-Os caminhos de dados e de saída são resolvidos a partir da localização dos
-módulos. Assim, os scripts podem ser executados sem depender do diretório atual.
+O alvo do modelo é `qt_vendida` — vendas observadas — e não a demanda estimada
+somando vendas e ruptura. Como o arquivo não informa planos futuros de preço,
+promoção ou ruptura, essas variáveis não são usadas como entradas da previsão.
 
-## Deduplicação
+## Estrutura do projeto
 
-Linhas idênticas são removidas. Quando uma chave `(sku_id, canal, semana)` tem
-registros diferentes, é mantido um único registro original: primeiro se prioriza
-o mais completo; em caso de empate, escolhe-se o mais próximo das medianas dos
-valores numéricos daquela chave, com desempate pela ordem no arquivo. Isso evita
-criar uma observação sintética por agregação e reduz a influência de valores
-extremos. Como o arquivo não fornece uma coluna de atualização ou confiabilidade
-da fonte, a ordem original é usada apenas como desempate determinístico.
+- `data/vendas_sku_semanal.csv`: dados de entrada, uma observação por SKU,
+  canal e semana.
+- `src/data_utils.py`: carregamento, deduplicação e preparação compartilhada.
+- `src/eda.py`: análise exploratória, gráficos e estimativa de elasticidade.
+- `src/model.py`: treinamento, avaliação, interpretação global e gráficos de
+  previsão.
+- `outputs/eda/`: gráficos e tabela de elasticidade gerados pela EDA.
+- `outputs/model/`: gráficos de vendas reais e previstas e explicações SHAP.
 
-## Preparação dos dados
+Os caminhos de entrada e saída são resolvidos a partir da localização dos
+módulos; não dependem do diretório atual.
 
-Na EDA, as distribuições e os registros negativos, os descontos acima de 100%
-e os preços acima de cinco vezes a mediana do SKU são exibidos antes da aplicação
-das regras de limpeza. A função `preparar_valores_ausentes_vendas` tem dois
-modos explícitos: a EDA usa `causal_imputation=False`, pois é análise descritiva
-e pode usar a série completa; a preparação do modelo usa `True`, pois não pode
-usar informação de semanas futuras.
+## Requisitos e execução
 
-Quantidade e receita são recuperadas quando os demais campos permitem usar a
-relação `receita = quantidade × preço`; somente depois são removidas as linhas
-que ainda não têm target ou receita. Na EDA, preço ausente/outlier pode ser
-recalculado pela receita/quantidade e o restante preenchido pela mediana do SKU.
-Se ainda houver preço ausente após esse fallback, a preparação da EDA gera erro
-explícito, em vez de retornar uma tabela aparentemente completa. No modelo, o
-preço usa somente histórico anterior; sem histórico, o NaN é mantido para
-LightGBM/XGBoost, que tratam valores ausentes nativamente.
-
-Subcategoria é imputada com mapeamento único de toda a série na EDA e apenas
-com um mapeamento já observado no passado para o modelo. Margem e desconto usam
-medianas de SKU-canal entre registros com receita positiva; no modelo, somente
-valores anteriores são considerados. Descontos acima de 100% são inválidos.
-Valores negativos de ruptura são limitados a zero, mas ausências de ruptura são
-preservadas. Na detecção causal de outlier de preço, a primeira observação de
-cada SKU-canal não é classificada: sem histórico anterior, o limite é NaN e a
-comparação não marca o preço como outlier.
-
-As features `preco_rel` e `demanda_real` não são criadas na preparação do modelo:
-a primeira não é usada pelo estimador; a segunda é uma métrica exploratória e
-seu filtro anterior dependia da mediana da série inteira, inclusive do teste.
-
-## Instalação
+Requer Python 3.11 ou superior. Instale as dependências fixadas no arquivo:
 
 ```powershell
 python -m pip install -r requirements.txt
 ```
 
-## Execução
-
-Na pasta `CASE_RGM_GB`:
+Na pasta do projeto, execute:
 
 ```powershell
 python src\eda.py
 python src\model.py
 ```
 
-`model.py` carrega e prepara os dados antes de treinar e avaliar os modelos.
-A EDA gera os gráficos em `outputs/eda/` e a tabela
-`14_elasticidade_promocional_por_sku.csv`. Ela estima, por SKU, a associação
-entre preço e quantidade vendida em escala log-log, controlando mecânicas
-promocionais, semana ISO do ano e canal. O intervalo de confiança de 95% da
-elasticidade-preço usa bootstrap por semana. A análise considera somente
-semanas sem ruptura, com venda positiva e preço observado plausível; SKUs com
-menos de 20 graus de liberdade residuais são sinalizados como amostra
-insuficiente, em vez de apresentar uma estimativa instável.
-Por exemplo, elasticidade `-0,5` indica que, na amostra analisada, uma alta de
-1% no preço está associada a uma queda aproximada de 0,5% na quantidade vendida.
+O CSV precisa estar em `data/vendas_sku_semanal.csv`. A EDA salva os gráficos
+em `outputs/eda/` e a tabela
+`14_elasticidade_promocional_por_sku.csv`; também exibe os gráficos durante a
+execução. O modelo salva `real_vs_previsto_venda_direta.png` e
+`real_vs_previsto_loja.png`, além de dois gráficos SHAP Waterfall em
+`outputs/model/`. Também imprime métricas e exemplos de previsão no console.
 
-Esses coeficientes são associações observacionais, não efeitos causais de uma
-promoção. Os efeitos das flags comparam cada mecânica com a ausência daquela
-flag, mantendo os demais fatores do modelo constantes; não estimam o efeito de
-cada ponto percentual adicional de desconto nem um limite ótimo de desconto.
+## Análise exploratória
 
+A EDA descreve a qualidade e a cobertura dos dados, além de explorar:
 
-## Modelo e avaliação temporal
+- ocorrência, volume e valor estimado das rupturas;
+- sazonalidade por semana, mês, categoria, SKU e canal;
+- distribuição de descontos e demanda por mecânica promocional;
+- correlações de demanda entre SKUs da mesma subcategoria;
+- variação de margem e diferenças entre canais;
+- associação entre preço e quantidade vendida.
 
-O alvo da regressão é `qt_vendida` (quantidade efetivamente vendida), não a
-demanda estimada somando vendas e ruptura. Os lags e as médias móveis também são
-calculados sobre `qt_vendida`, por SKU e canal, sempre com deslocamento de uma
-semana para não usar a observação que será prevista.
+A elasticidade-preço é estimada por SKU em escala log-log, controlando
+mecânicas promocionais, semana ISO e canal. O intervalo de confiança de 95% é
+obtido por bootstrap de semanas. A análise usa semanas sem ruptura, com venda
+positiva e preço observado plausível. SKUs com menos de 20 graus de liberdade
+residuais são sinalizados como insuficientes para uma estimativa estável.
 
-O modelo exclui os registros anteriores a 2025-01-01 antes de criar os atributos
-temporais, pois 2024 tem apenas onze semanas observadas e possui comportamento atípico de demanda por SKU quando comparado à demanda de 2025 a 2026.
+Por exemplo, uma elasticidade de `-0,5` indica que, na amostra, uma alta de 1%
+no preço está associada a uma queda aproximada de 0,5% na quantidade vendida.
+Os coeficientes e as comparações promocionais são associações observacionais,
+não efeitos causais. Os efeitos das flags comparam cada mecânica com a ausência
+daquela flag, mantendo os demais fatores constantes; não estimam o efeito de
+cada ponto percentual de desconto nem um desconto ótimo.
 
-São comparados LightGBM e XGBoost. Categorias de SKU, canal e subcategoria são
-codificadas em one-hot. `preparar_dados_modelo`
-faz os tratamentos causais em `src/data_utils.py`: preço, desconto e margem
-ausentes usam histórico disponível, sem recorrer a semanas futuras ou à receita
-da semana prevista. Para a previsão recursiva de oito semanas, as entradas do
-modelo são SKU, canal, subcategoria, sazonalidade (`semana_seno` e
-`semana_cosseno`) e histórico de venda (`venda_defasada_*`, `media_movel_*` e
-`desvio_padrao_movel_4`). A cada semana do horizonte, lags e médias são
-recalculados com as previsões anteriores do próprio modelo. Preço, promoção e
-ruptura não entram no modelo porque o CSV não fornece seus valores planejados
-para as semanas futuras; incluí-los com os valores realizados criaria
-informação indisponível na data da previsão.
+## Modelo e avaliação
 
-O corte é móvel e usa as semanas presentes no CSV. As oito semanas finais ficam
-reservadas para o teste final. Antes delas, 32 semanas são usadas em validação
-cruzada com quatro origens de previsão: cada bloco tem oito semanas, e o treino
-de cada rodada contém todas as semanas anteriores ao respectivo bloco. Assim,
-o treino cresce de uma rodada para a seguinte.
+### Atributos e previsão
 
-Em cada bloco, o modelo prevê as oito semanas em sequência. A previsão da
-primeira semana é usada como histórico para prever a segunda, e assim por
-diante; as vendas reais do bloco só são usadas depois para medir os erros. Os
-modelos padrão são comparados pela WAPE agregada das quatro simulações (MAE
-como desempate). A busca aleatória avalia 12 combinações de parâmetros pela
-mesma simulação recursiva. O modelo selecionado é então ajustado com todo o
-histórico anterior ao teste e gera uma única previsão recursiva para as oito
-semanas finais, sem atualização com vendas reais. O teste não participa da
-seleção nem do ajuste.
+São comparados LightGBM e XGBoost. SKU, canal e subcategoria são codificados
+em one-hot. Os atributos numéricos incluem sazonalidade anual
+(`semana_seno`, `semana_cosseno`) e histórico de venda por SKU e canal:
+defasagens de uma, duas, quatro e oito semanas, médias móveis de quatro e oito
+semanas e desvio-padrão móvel de quatro semanas. As estatísticas históricas são
+defasadas em uma semana para não incluir o resultado previsto.
 
-Como o CSV não informa lead times de fornecedores, a janela de oito semanas é
-um horizonte de avaliação, não uma afirmação de que esse seja o prazo real de
-compra; deve ser validada com a área de negócio. Os folds respeitam a ordem do
-tempo e simulam o que estaria disponível na data de cada previsão. A busca de
-parâmetros e a escolha do modelo reutilizam as mesmas janelas, portanto a
-métrica da validação pode ficar otimista por seleção repetida. O teste final
-permanece separado e fornece a avaliação independente.
+O modelo exclui datas anteriores a 2025-01-01 antes de criar os atributos
+temporais. O período de 2024 contém apenas onze semanas observadas e apresenta
+comportamento atípico em relação a 2025 e 2026.
 
-Preço, promoção e ruptura futura são tratados como desconhecidos e não são
-usados como entradas. Se a operação tiver planos futuros confiáveis para essas
-variáveis, elas poderão ser adicionadas depois e avaliadas sem usar seus valores
-realizados como substitutos.
+Cada previsão cobre oito semanas recursivamente: as previsões anteriores do
+próprio modelo são usadas para atualizar lags e médias móveis dentro do
+horizonte. Preço, promoção e ruptura futura não são entradas, pois seus valores
+planejados não estão disponíveis no CSV. Usar valores realizados para essas
+semanas introduziria informação que não estaria disponível no momento da
+previsão.
 
-Como o alvo é venda observada, e não demanda irrestrita, a previsão não corrige
-por uma eventual ruptura futura que ainda não tenha sido informada.
+### Validação temporal
 
-Para facilitar a leitura do resultado no negócio, a execução salva dois
-gráficos PNG em `outputs/model/`: `real_vs_previsto_venda_direta.png` e
-`real_vs_previsto_loja.png`. Cada gráfico mostra as séries de venda real e
-prevista no teste para os 20 SKUs daquele canal (40 combinações SKU-canal no
-total), com uma faixa empírica P90. As previsões incluem o número da semana do
-horizonte (`horizonte`), de 1 a 8.
+O corte usa as semanas presentes no CSV. As oito semanas finais são reservadas
+para o teste. As 32 semanas anteriores formam quatro blocos de validação de
+oito semanas; em cada origem, o treino contém somente semanas anteriores ao
+bloco de validação. O treino cresce de uma rodada para a seguinte.
 
-Para mostrar quanto as previsões podem variar, usamos os erros das simulações
-recursivas de validação. O erro P90 é calculado separadamente pela posição no
-horizonte (semana 1 a 8) e pelo porte da previsão (menos de 50, de 50 a 150 e
-mais de 150 unidades). Assim, uma previsão distante não herda automaticamente
-o mesmo raio de erro de uma previsão próxima.
+Em cada bloco, o modelo prevê as oito semanas em sequência sem usar as vendas
+reais do bloco para atualizar o histórico. Os modelos padrão são comparados
+pela WAPE agregada da validação, usando MAE como desempate. Depois, 12
+combinações de hiperparâmetros do modelo padrão vencedor são avaliadas nas
+mesmas janelas e pela mesma previsão recursiva. O modelo selecionado é ajustado
+com todo o período anterior ao teste e gera uma única previsão recursiva para
+as oito semanas finais. O teste não participa da seleção nem do ajuste.
 
-`erro_p90_unidades` é um erro de referência em unidades para cada combinação de
-semana do horizonte e faixa de volume. P90 significa que, nas simulações usadas
-para esse cálculo, 90% dos erros absolutos ficaram nesse valor ou abaixo dele.
-Por exemplo, se uma previsão for de 100 unidades e o erro P90 daquela semana
-do horizonte e faixa for 20, mostramos uma faixa de 80 a 120 unidades
-(`previsao_inferior` e `previsao_superior`). A previsão inferior nunca fica
-abaixo de zero.
+A validação e a busca reutilizam as mesmas janelas; a seleção repetida pode
+deixar as métricas de validação otimistas. O teste final permanece separado
+para fornecer uma avaliação independente.
 
-`largura_faixa_pct` mostra o tamanho total da faixa comparado com a previsão. No
-exemplo, a faixa vai de 80 a 120: sua largura é 40 unidades, ou 40% da previsão
-de 100. Em geral, um percentual menor significa uma faixa mais estreita em
-relação ao volume previsto. Para uma previsão igual a zero, esse percentual não
-é calculado.
+### Métricas e interpretação
 
-A tabela `erro_oof_por_horizonte_e_faixa`, retornada com os resultados, mostra
-o erro P90 em unidades e a quantidade de observações para cada combinação de
-semana do horizonte e porte da previsão. Se uma combinação não tiver
-observações, o erro fica indefinido; não usamos o erro de outra faixa no lugar.
-Essa faixa é uma referência baseada no histórico, não uma garantia de que o
-valor real ficará dentro dela. O resultado também informa WAPE, MAE e viés por
-semana do horizonte, tanto na validação quanto no teste.
+O resultado apresenta WAPE, MAE e BIAS:
 
-O console também mostra SKU_01 como exemplo por canal: WAPE e erro absoluto
-médio em unidades por semana, além de uma estimativa do valor bruto de vendas
-associado ao erro, calculada como a média semanal de
-`|real - previsto| × preco_medio`. Essa conversão é uma proxy para contextualizar
-a escala do erro, não uma estimativa de prejuízo, custo de estoque ou custo de
-ruptura: esses impactos dependem de margem, custos, nível de serviço, lead time
-e decisões de reposição, informações que o CSV não fornece. Se não houver preço
-válido no teste, o valor em reais não é estimado. Como o alvo é venda observada,
-esse exemplo também não recupera a demanda que deixou de ser atendida durante
-rupturas.
+- **WAPE**: soma dos erros absolutos dividida pela soma das vendas reais
+  absolutas. Resume o erro relativo agregado; menor é melhor.
+- **MAE**: média dos erros absolutos, em unidades vendidas. Indica o tamanho
+  típico do erro; menor é melhor.
+- **BIAS**: erro médio (previsto menos real) dividido pela média real. Valor
+  positivo indica tendência a superestimar; negativo, a subestimar; zero indica
+  ausência de viés médio. Valores positivos e negativos podem se compensar.
 
-`best_hyperparameters` contém os parâmetros do estimador selecionado, e não de
-uma busca candidata que tenha perdido.
+As métricas são apresentadas para validação e teste; WAPE e MAE também são
+detalhadas por semana do horizonte. O console inclui ainda um exemplo de
+tradução do erro do SKU_01 por canal. A conversão para reais usa
+`|real - previsto| × preco_medio` como proxy de valor bruto associado ao erro;
+não é uma estimativa de prejuízo, custo de estoque ou custo de ruptura.
+
+Para explicar previsões individuais, são salvos dois gráficos SHAP Waterfall:
+um para SKU_01 na primeira semana do teste em cada canal
+(`shap_waterfall_sku_01_venda_direta.png` e
+`shap_waterfall_sku_01_loja.png`). O ponto de partida é a previsão-base do
+modelo; cada barra mostra quanto uma variável aumenta ou reduz a saída até
+chegar à previsão daquela linha. As categorias one-hot são agrupadas pelo
+atributo original, e as contribuições são expressas em unidades previstas.
+As features usadas são exatamente as da previsão recursiva, incluindo as
+vendas previstas usadas como histórico quando aplicável.
+
+Esses gráficos explicam exemplos específicos, não todas as previsões do teste.
+SHAP descreve como o modelo chegou à saída para aquelas entradas; não demonstra
+causalidade. Se a saída bruta do modelo for negativa, o gráfico explica essa
+saída antes do limite mínimo aplicado para apresentar previsões não negativas.
+
+### Faixa empírica de erro
+
+Para comunicar a variabilidade das previsões, o erro absoluto do percentil 90
+(P90) é calculado a partir das previsões fora da amostra (*out-of-fold*, OOF)
+da validação, por semana do horizonte e faixa de volume previsto: menos de 50,
+de 50 a 150 e mais de 150 unidades. P90 é o valor em que 90% dos erros
+observados ficaram abaixo ou iguais nas simulações usadas para a calibração.
+
+Por exemplo, se a previsão for 100 unidades e o erro P90 correspondente for
+20, a faixa exibida será de 80 a 120 (`previsao_inferior` e
+`previsao_superior`). O limite inferior é truncado em zero. `largura_faixa_pct`
+expressa a largura total como percentual da previsão e não é calculada quando
+a previsão é zero.
+
+A tabela `erro_oof_por_horizonte_e_faixa` contém o erro P90 e a quantidade de
+observações de cada combinação. Se não houver observações para uma combinação,
+o erro fica indefinido; não é substituído pelo de outra faixa. Essas faixas são
+referências empíricas, não garantias de cobertura nem intervalos de confiança.
+
+## Preparação dos dados
+
+Linhas exatamente duplicadas são removidas. Para registros diferentes com a
+mesma chave `(sku_id, canal, semana)`, mantém-se uma linha original: prioriza-se
+a de maior completude; em caso de empate, escolhe-se a mais próxima das
+medianas dos valores numéricos da chave. A ordem no arquivo desempata os casos
+restantes. Não se agrega o grupo em uma observação sintética, pois não há
+coluna de atualização ou confiabilidade da fonte.
+
+Na EDA, distribuições e registros potencialmente inválidos são examinados
+antes da limpeza. A função `preparar_valores_ausentes_vendas` tem dois modos:
+a EDA pode usar a série completa, enquanto a preparação do modelo usa somente
+informações anteriores para imputar atributos.
+
+Quantidade e receita são recuperadas quando os demais campos permitem usar
+`receita = quantidade × preço`; linhas que continuam sem target ou receita
+são removidas. Quantidades negativas são convertidas em valores absolutos.
+Preços ausentes ou extremos podem ser reconstruídos pela receita dividida pela
+quantidade; na EDA, os casos restantes usam a mediana do SKU. No modelo, o
+preço usa apenas histórico anterior e continua ausente se não houver referência
+histórica. Preços acima de cinco vezes a mediana de referência do SKU são
+tratados como extremos; no modelo, a referência é calculada apenas com o
+histórico anterior do SKU-canal.
+
+Subcategoria é imputada com um mapeamento único da série na EDA e apenas com
+um mapeamento já observado no passado para o modelo. Margem e desconto usam
+medianas de SKU-canal entre registros com receita positiva; no modelo, somente
+valores anteriores são considerados. Descontos acima de 100% são tratados
+como inválidos. Rupturas negativas são limitadas a zero e valores ausentes de
+ruptura são preservados. Na detecção causal de preços extremos, a primeira
+observação de cada SKU-canal não é classificada por não haver histórico
+anterior.
+
+`preco_rel` não é usado pelo estimador. `demanda_real` é uma métrica exploratória
+e não é o alvo do modelo, que prevê vendas observadas. Por isso, a previsão não
+corrige por uma ruptura futura ainda não informada.
+
+## Limitações e termos
+
+- O CSV não informa lead time de fornecedores. O horizonte de oito semanas é
+  uma escolha de avaliação, não uma afirmação sobre o prazo de compra; deve
+  ser validado com a área de negócio.
+- Sem planos futuros confiáveis de preço, promoção e ruptura, essas variáveis
+  são consideradas desconhecidas. Se os planos passarem a existir, podem ser
+  incorporados e avaliados sem substituí-los por valores realizados.
+- A EDA pode usar estatísticas da série completa para fins descritivos; esse
+  modo não é usado na preparação causal do modelo.
+- **One-hot**: representação de uma categoria por colunas indicadoras.
+- **Fold**: uma rodada de validação; neste projeto, cada bloco valida oito
+  semanas e treina apenas com o passado.
+- **OOF (out-of-fold)**: previsões feitas em blocos de validação que não foram
+  usados para ajustar o modelo daquela rodada.
+- **Bootstrap**: reamostragem de semanas para estimar a variabilidade da
+  elasticidade.
+- **SHAP Waterfall**: gráfico de explicação local que decompõe uma previsão em
+  uma saída-base mais contribuições positivas e negativas das variáveis.
+- **NaN**: valor ausente. Os modelos de árvore usados aqui tratam valores
+  numéricos ausentes diretamente.
+
+`best_hyperparameters` contém os parâmetros do estimador selecionado; não
+retorna parâmetros de uma configuração candidata que tenha perdido a seleção.

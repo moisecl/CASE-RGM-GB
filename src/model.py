@@ -11,6 +11,18 @@ anterior às oito semanas finais e avaliado nessas semanas, também de forma
 recursiva. Assim, o teste representa uma única previsão de oito semanas, e não
 oito previsões semanais atualizadas com vendas reais.
 
+A confiabilidade é resumida por faixas de porte da previsão (<50, 50–150 e
+>150 unidades) e por semana do horizonte. Para cada combinação, calcula-se o
+percentil 90 dos erros absolutos das previsões OOF de validação; esse valor
+forma uma margem empírica acima e abaixo da previsão. As faixas refletem erros
+observados em validação e não são garantias de que o valor real ficará dentro
+delas.
+
+Gráficos SHAP Waterfall explicam contribuições locais para uma previsão de
+SKU_01 na primeira semana do teste, em cada canal. As contribuições das
+categorias one-hot são agrupadas pela variável original e expressas em unidades
+vendidas. São exemplos de previsões específicas, não explicações causais.
+
 Modelos:
 * LightGBM: rápido e eficiente em dados tabulares; modelos muito complexos
   podem sobreajustar e árvores não extrapolam tendências.
@@ -27,6 +39,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import shap
 from lightgbm import LGBMRegressor
 from sklearn.base import BaseEstimator, clone
 from sklearn.compose import ColumnTransformer
@@ -110,6 +123,114 @@ def _make_pipeline(estimator: BaseEstimator) -> Pipeline:
     return Pipeline(
         steps=[("preprocessing", preprocessor), ("model", estimator)]
     )
+
+
+def _save_shap_waterfall(
+    pipeline: Pipeline,
+    explainer: shap.TreeExplainer,
+    feature_row: pd.DataFrame,
+    prediction_row: pd.Series,
+    filename: str,
+) -> Path:
+    """Salva uma explicação SHAP local agrupada por variável de negócio."""
+    preprocessor = pipeline.named_steps["preprocessing"]
+    estimator = pipeline.named_steps["model"]
+    transformed_features = preprocessor.transform(feature_row[FEATURES])
+    shap_values = explainer(transformed_features)
+    if shap_values.values.ndim != 2 or shap_values.values.shape[0] != 1:
+        raise ValueError("A explicação SHAP deve corresponder a uma previsão.")
+
+    encoded_values = np.asarray(shap_values.values[0], dtype=float)
+    encoder = pipeline.named_steps["preprocessing"].named_transformers_[
+        "categorical"
+    ]
+    categorical_labels = {
+        "sku_id": "SKU",
+        "canal": "Canal",
+        "subcategoria_id": "Subcategoria",
+    }
+    offset = 0
+    grouped_values = []
+    feature_labels = []
+    for feature, categories in zip(CATEGORICAL_FEATURES, encoder.categories_):
+        next_offset = offset + len(categories)
+        category_value = feature_row.iloc[0][feature]
+        grouped_values.append(float(encoded_values[offset:next_offset].sum()))
+        feature_labels.append(
+            f"{categorical_labels[feature]}: {category_value}"
+        )
+        offset = next_offset
+
+    if len(encoded_values) != offset + len(NUMERIC_FEATURES):
+        raise ValueError(
+            "A quantidade de valores SHAP não corresponde às "
+            "features numéricas e categóricas transformadas."
+        )
+    numeric_labels = {
+        "semana_seno": "Sazonalidade anual (componente seno)",
+        "semana_cosseno": "Sazonalidade anual (componente cosseno)",
+        "venda_defasada_1": "Vendas na semana anterior (un.)",
+        "venda_defasada_2": "Vendas há 2 semanas (un.)",
+        "venda_defasada_4": "Vendas há 4 semanas (un.)",
+        "venda_defasada_8": "Vendas há 8 semanas (un.)",
+        "media_movel_4": "Média de vendas nas últimas 4 semanas (un.)",
+        "media_movel_8": "Média de vendas nas últimas 8 semanas (un.)",
+        "desvio_padrao_movel_4": (
+            "Variação das vendas nas últimas 4 semanas (un.)"
+        ),
+    }
+    for index, feature in enumerate(NUMERIC_FEATURES):
+        value = feature_row.iloc[0][feature]
+        formatted_value = (
+            "indisponível"
+            if pd.isna(value)
+            else f"{float(value):.2f}".replace(".", ",")
+        )
+        grouped_values.append(float(encoded_values[offset + index]))
+        feature_labels.append(
+            f"{numeric_labels[feature]}: {formatted_value}"
+        )
+
+    base_value = float(np.asarray(shap_values.base_values).reshape(-1)[0])
+    raw_prediction = float(estimator.predict(transformed_features)[0])
+    explained_prediction = base_value + sum(grouped_values)
+    if not np.isclose(explained_prediction, raw_prediction, rtol=1e-4, atol=1e-4):
+        raise ValueError(
+            "Os valores SHAP não recompõem a saída do modelo para a previsão."
+        )
+
+    explanation = shap.Explanation(
+        values=np.asarray(grouped_values),
+        base_values=base_value,
+        feature_names=feature_labels,
+    )
+    channel = prediction_row["canal"]
+    week = prediction_row["semana"]
+    final_prediction = float(prediction_row["previsao"])
+    title = (
+        f"Por que o modelo previu {final_prediction:.1f} unidades?\n"
+        f"{prediction_row['sku_id']} | canal {channel} | "
+        f"semana {week:%Y-%m-%d} (horizonte "
+        f"{int(prediction_row['horizonte'])})"
+    )
+    if not np.isclose(raw_prediction, final_prediction, rtol=1e-5, atol=1e-5):
+        title += (
+            f"\nSaída bruta do modelo: {raw_prediction:.1f} un.; "
+            "a previsão final é limitada a zero"
+        )
+
+    shap.plots.waterfall(
+        explanation,
+        max_display=len(feature_labels),
+        show=False,
+    )
+    figure = plt.gcf()
+    figure.set_size_inches(13, 9)
+    plt.title(title, fontsize=12, pad=16)
+    output_path = MODEL_OUTPUT_DIR / filename
+    figure.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(figure)
+    return output_path
 
 
 def _metrics(actual: pd.Series, predicted: np.ndarray) -> dict[str, float]:
@@ -300,7 +421,7 @@ def _forecast_recursively(
     pipeline: Pipeline,
     history: pd.DataFrame,
     forecast_rows: pd.DataFrame,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Prevê semanas futuras em sequência, usando previsões como histórico."""
     forecast_weeks = pd.Index(
         forecast_rows["semana"].drop_duplicates().sort_values()
@@ -317,9 +438,11 @@ def _forecast_recursively(
 
     working_history = history[["sku_id", "canal", "semana", TARGET]].copy()
     results = []
+    feature_rows = []
     for horizon, week in enumerate(forecast_weeks, 1):
         week_rows = forecast_rows.loc[forecast_rows["semana"] == week].copy()
         week_features = preparar_features_semana(working_history, week_rows)
+        feature_rows.append(week_features[FEATURES].copy())
         prediction = np.clip(
             pipeline.predict(week_features[FEATURES]), 0, None
         )
@@ -339,7 +462,9 @@ def _forecast_recursively(
             [working_history, predicted_history], ignore_index=True
         )
 
-    return pd.concat(results).sort_values(["semana", "sku_id", "canal"])
+    forecast = pd.concat(results).sort_values(["semana", "sku_id", "canal"])
+    forecast_features = pd.concat(feature_rows).loc[forecast.index]
+    return forecast, forecast_features
 
 
 def _evaluate_recursive_model(
@@ -371,9 +496,10 @@ def _evaluate_recursive_model(
         )
         train_targets.append(y_train)
         train_predictions.append(train_prediction)
-        validation_predictions.append(
-            _forecast_recursively(pipeline, history, forecast_rows)
+        validation_prediction, _ = _forecast_recursively(
+            pipeline, history, forecast_rows
         )
+        validation_predictions.append(validation_prediction)
 
     oof_predictions = pd.concat(validation_predictions).sort_index()
     cross_validation_scores = _metrics(
@@ -617,8 +743,15 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
     features = pre_test[FEATURES]
     target = pre_test[TARGET]
     candidates: dict[str, BaseEstimator] = {
-        "LightGBM": LGBMRegressor(verbosity=-1, random_state=RANDOM_STATE),
-        "XGBoost": XGBRegressor(random_state=RANDOM_STATE),
+        "LightGBM": LGBMRegressor(
+            verbosity=-1,
+            random_state=RANDOM_STATE,
+            importance_type="gain",
+        ),
+        "XGBoost": XGBRegressor(
+            random_state=RANDOM_STATE,
+            importance_type="total_gain",
+        ),
     }
     model_results = {}
     recursive_evaluations = {}
@@ -768,7 +901,7 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         pre_test[TARGET], train_prediction
     )
 
-    predictions = _forecast_recursively(
+    predictions, prediction_features = _forecast_recursively(
         selected_pipeline,
         pre_test[["sku_id", "canal", "semana", TARGET]],
         test,
@@ -786,6 +919,32 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         for horizon, group in predictions.groupby("horizonte", sort=True)
     }
     chart_paths = _save_test_forecast_charts(predictions)
+    shap_explainer = shap.TreeExplainer(
+        selected_pipeline.named_steps["model"]
+    )
+    shap_chart_paths = {}
+    channels = {
+        "Venda Direta": "venda_direta",
+        "Loja": "loja",
+    }
+    for channel, filename in channels.items():
+        examples = predictions.loc[
+            predictions["sku_id"].eq("SKU_01")
+            & predictions["canal"].eq(channel)
+            & predictions["horizonte"].eq(1)
+        ]
+        if examples.empty:
+            raise ValueError(
+                f"Não há previsão de SKU_01 no horizonte 1 para o canal {channel}."
+            )
+        prediction_index = examples.index[0]
+        shap_chart_paths[channel] = _save_shap_waterfall(
+            selected_pipeline,
+            shap_explainer,
+            prediction_features.loc[[prediction_index]],
+            examples.iloc[0],
+            f"shap_waterfall_sku_01_{filename}.png",
+        )
 
     print("\nResultado final do modelo selecionado:")
     print(f"Modelo: {selected_name}")
@@ -800,6 +959,9 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         f"| Erro médio (MAE): {test_scores['mae']:.2f} unidades "
         f"| Tendência a super/subestimar (BIAS): {test_scores['bias']:.2%}"
     )
+    print("Gráficos SHAP Waterfall (explicação de SKU_01 na semana 1 do teste):")
+    for channel, chart_path in shap_chart_paths.items():
+        print(f"  {channel}: {chart_path}")
     for horizon, horizon_scores in test_scores["por_horizonte"].items():
         print(
             f"  Semana {horizon}: WAPE {horizon_scores['wape']:.2%}; "
@@ -836,6 +998,7 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         },
         "model_comparison": model_results,
         "best_hyperparameters": selected_parameters,
+        "shap_waterfall_charts": shap_chart_paths,
         "erro_oof_por_horizonte_e_faixa": error_by_bucket,
         "feature_descriptions": FEATURE_DESCRIPTIONS,
         "periods": {

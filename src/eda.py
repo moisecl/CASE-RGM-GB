@@ -246,8 +246,8 @@ COMENTÁRIOS:
 SHAPE: 3,736 linhas e 14 colunas
 qt_vendida com mínimo negativo → conferir coerência com receita e preço médio
 receita e preco_medio com possíveis outliers → verificar se são erros de digitação ou promoções legítimas
-deconto_pct com valores > 100% → Não faz sentido, provavelmente erro na fonte de dados
-Há 20 skus, 3 categorias, 8 subcategorias e 2 canais
+desconto_pct com valores > 100% → Não faz sentido, provavelmente erro na fonte de dados
+Há 20 SKUs, 3 categorias, 8 subcategorias e 2 canais
 
 """
 
@@ -267,7 +267,6 @@ fig, ax = plt.subplots(figsize=(10, 5))
 sns.heatmap(df.isna(), cbar=False, cmap='gray_r', ax=ax, yticklabels=False)
 ax.set_title('Mapa de valores ausentes (linha = observação, coluna = campo)')
 save_show(fig, '01_dados_faltantes')
-plt.show()
 
 """
 COMENTÁRIOS
@@ -316,7 +315,7 @@ print(f'Nº de semanas ISO distintas: {df["semana_dt"].dt.to_period("W").nunique
 """
 COMENTÁRIOS
 - Após o parsing, o intervalo temporal vai de Fevereiro de 2024 a Dezembro de 2026, 
-cobrindo 94 distintas.
+cobrindo 94 semanas distintas.
 
 """
 
@@ -394,9 +393,9 @@ print(df[df['qt_vendida'] < 0]
 """
 COMENTÁRIOS:
 - A coluna qt_vendida tem  3 valores negativos, suspeita-se que sejam erros na fonte de dados, visto que
-a fonte de dados não aparenta incluir valores de "devolução"(apenas 3 registros).
+a fonte de dados não aparenta incluir valores de "devolução" (apenas 3 registros).
 - Além disso, a coluna receita está positiva e é igual ao qt_vendida(positiva) multiplicada pelo preço médio. 
-Nesse contexto, optou-se por transformar a quantidade como qt_vendida em valores absolutos(positivos), para manter 
+Nesse contexto, optou-se por tomar o valor absoluto de qt_vendida, para manter 
 a coerência com a receita e o preço médio. Tratamento em 'data_utils.py'
 """
 
@@ -415,7 +414,6 @@ n_descontos_invalidos = len(descontos_invalidos)
 COMENTÁRIOS: Descontos superiores a 100% não fazem sentido, 
 provavelmente erro na fonte de dados, dessa forma optou-se por retirar da análise e do modelo
 Tratamento em 'data_utils.py'
-- 
 """
 # Avaliação dos outliers de preço médio observados na análise descritiva
 
@@ -430,7 +428,7 @@ save_show(fig, '02_preco_por_sku_boxplot')
 
 """
 COMENTÁRIO: Nota-se que há 3 skus com valores "muito fora da curva", acredita-se que houve
-erro de inputação de preço médio vide a distribuição. 
+erro de inputação de preço médio conforme a distribuição. 
 Vamos aplicar uma correção, usando a premissa já usada: preco_medio = receita/qt_vendida 
 e avaliar se o preço ajustado se encaixa na distribuição do preço do SKU.
 """
@@ -491,7 +489,7 @@ assumiu-se como linha não válida para uso
   venda; preencher receita com zero preserva essa observação sem inventar demanda.
 - Preço ausente em registros com quantidade e receita iguais a zero é compatível
   com ausência de venda: sem transação não há preço observado.
-- Para a subcategoria também pode ser preenchida quando SKU, categoria e canal 
+- A subcategoria também pode ser preenchida quando SKU, categoria e canal 
 apontam para uma única subcategoria.
 - Mantemos qt_ruptura ausente porque ausência não significa zero. 
 - Para os demais campos: margem_pct e desconto_pct considerou-se o imput 
@@ -627,7 +625,7 @@ save_show(fig, '03_valor_ruptura_por_sku')
 
 """
 COMENTÁRIO: O SKU_01 concentra o maior valor estimado (quase 9x superior ao segundo colocado, SKU_10), e com 15% das semanas
-com ruptura no período avaliado, portanto é um SKU prioritário e provalmente o TOP em vendas.
+com ruptura no período avaliado, portanto é um SKU prioritário e provavelmente o TOP em vendas.
 """
 
 ## Comparação: distribuição de qt_vendida nas semanas COM vs SEM ruptura
@@ -654,9 +652,9 @@ print('\n--- MÉDIA/MEDIANA DE qt_vendida: COM vs SEM ruptura ---')
 print(comp.round(2))
 
 """
-COMENTÁRIO: a distribuição mostra vendas com e sem ruptura, nota-se que a disrtbuição em ambos os cenários
-são semelhantes. No cenário Sem ruptura, há semanas com maior pico de vendas, embora a média de vendas Com ruptura tenha sido 9% superior
-à semanas Sem ruputura, o que pode indicar eventos promocionais, sazonalidade que aumentaram o volume de vendas em algumas semanas, descolando a distribuição média para cima
+COMENTÁRIO: a distribuição mostra vendas com e sem ruptura, nota-se que a distribuição em ambos os cenários
+é semelhante. No cenário Sem ruptura, há semanas com maior pico de vendas, embora a média de vendas Com ruptura tenha sido 9% superior
+às semanas Sem ruptura, o que pode indicar eventos promocionais, sazonalidade que aumentaram o volume de vendas em algumas semanas, deslocando a distribuição média para cima
 """
 #-------------------------------------------------------------------------------#
 
@@ -665,7 +663,6 @@ são semelhantes. No cenário Sem ruptura, há semanas com maior pico de vendas,
 # Transformar a semana em semana ISO (segunda a domingo)
 df['semana_iso'] = df['semana_dt'].dt.isocalendar().week.astype(int)
 df['mes'] = df['semana_dt'].dt.month
-df['trimestre'] = df['semana_dt'].dt.quarter
 
 # Ruptura e demanda real totais por semana ISO
 ruptura_demanda_semana = (
@@ -759,7 +756,7 @@ save_show(fig, '07_sazonalidade_semana_por_canal')
 
 """
 COMENTÁRIO: os trechos sombreados destacam a sazonalidade, além disso observa-se como
-no fim do ano ocorrem picos e no ínicio do ano a demanda é mais baixa, após a semana 20
+no fim do ano ocorrem picos e no início do ano a demanda é mais baixa, após a semana 20
 observa-se relativa estabilidade.
 """
 
@@ -780,7 +777,7 @@ save_show(fig, '08_sazonalidade_mes')
 
 """
 COMENTÁRIO: Os meses de Novembro e Dezembro são os mais desafiadores devido a alta variabilidade.
-Abril e Maio tem semelhanças com o fim do ano, os demais meses comportamento semelhante.
+Abril e Maio têm semelhanças com o fim do ano, os demais meses têm comportamento semelhante.
 Obs: Os pontos extremos foram ocultados apenas nesta
 visualização para facilitar a comparação; eles continuam nos dados e nas análises.
 """
@@ -803,8 +800,8 @@ save_show(fig, '09_sazonalidade_por_categoria')
 
 """
 COMENTÁRIO: Observa-se que a categoria B possui maior demanda, mas todas as subcategorias apresentam
-comportamentos semelhantes ao longo do ano, como observado na curva de demanda geral. Interesse notar que todas as categorias
-possuem picos proximos a semana 15 e semana 37, possivelmente por promoções e/ou datas comemorativas
+comportamentos semelhantes ao longo do ano, como observado na curva de demanda geral. É interessante notar que todas as categorias
+possuem picos proximos à semana 15 e semana 37, possivelmente por promoções e/ou datas comemorativas
 Obs: Os painéis mantêm escalas independentes para tornar legíveis as
 oscilações internas de cada categoria. 
 """
@@ -857,9 +854,9 @@ plt.tight_layout()
 save_show(fig, '10_demanda_por_sku')
 
 """
-COMENTÁRIO: Destaques obervados: 
-- SKU 03 e SKU 15 apresentam tendência de crescimento de demanda,
-- SKU 02 e 13 aparentam ser lançamentos dado o horizonte temporal de vendas
+COMENTÁRIO: Destaques observados: 
+- SKU_03 e SKU_15 apresentam tendência de crescimento de demanda,
+- SKU_02 e SKU_13 aparentam ser lançamentos dado o horizonte temporal de vendas
 - A demanda de 2024 para todos os SKUs com vendas nesse período apresenta comportamento atípico 
 vs 2025 e 2026
 
@@ -890,8 +887,8 @@ ax.set_xlabel('Semana ISO'); ax.set_ylabel('')
 save_show(fig, '11_heatmap_sku_semana')
 
 """
-COMENTÁRIO: Complementar à visão anterior, nota-se que os picos são semelhantes entre
-todos os SKUs, destaque para os SKUs 01 e 10 que apresentam os maiores picos, sobretudo na semana 19
+COMENTÁRIO: Complementando a visão anterior, nota-se que os picos são semelhantes entre
+todos os SKUs, com destaque para o SKU_01 e SKU_10 que apresentam os maiores picos, sobretudo na semana 19
 e semanas dos meses de Novembro e Dezembro
 """
 #-------------------------------------------------------------------------------#
@@ -920,9 +917,9 @@ ax.spines[['top', 'right']].set_visible(False)
 save_show(fig, '12_desconto_por_mecanica')
 
 """
-COMENTÁRIO: De forma geral, as mecânicas de Desconto Direto e Combo foram as mais utlizdas,
-10 e 9%, respecitvamente. Embora a mecânica Pague e Leve seja a menos frequente, ela é a mais "agressiva",
-com desconto mediano superando os 30%. Além disso, aparentemente há alguma politica de desconto máximo de até 45%
+COMENTÁRIO: De forma geral, as mecânicas de Desconto Direto e Combo foram as mais utilizdas,
+10 e 9%, respectivamente. Embora a mecânica Pague e Leve seja a menos frequente, ela é a mais "agressiva",
+com desconto mediano superando os 30%. Além disso, aparentemente há alguma política de desconto máximo de até 45%
 de demanda.
 """
 
@@ -950,13 +947,13 @@ save_show(fig, '13_boxplot_demanda_por_mecanica')
 
 """
 COMENTÁRIO: Com base no que vimos até aqui, o SKU_01 aparenta ser o "Hero" da marca, visto que
-a demanda mediana varia de cerca de 225 unidades/semana para aproximadamente 300 unidadades/semana com o Desconto Direto.
-A mecância de Combo aparenta ser bem efetiva para esse SKU, com a demanda mínima próxima a mediana não promocional
-Para o SKU_10, a mecânica que indica alguma efetividade é a Pague e Leve, com cerca 75% da distribuição da demanda superior a 
+a demanda mediana varia de cerca de 225 unidades/semana para aproximadamente 300 unidades/semana com o Desconto Direto.
+A mecânica de Combo aparenta ser bem efetiva para esse SKU, com a demanda mínima próxima à mediana não promocional
+Para o SKU_10, a mecânica que indica alguma efetividade é a Pague e Leve, com cerca 75% da distribuição da demanda superior à 
 mediana da distribuição não promocional
-Analisando os demais SKUs do TOP5, observa-se que cada SKU possui suas e características
-OBS: Embora é possivel observar diferenças claras entre mecânicas, para um diagnóstico mais conclusivo 
-e estatísticamente confiável, Testes A/B podem comprovar o fenômeno aqui observado e indicar qual a 
+Analisando os demais SKUs do TOP5, observa-se que cada SKU possui suas características
+OBS: Embora é póssível observar diferenças claras entre mecânicas, para um diagnóstico mais conclusivo 
+e estatisticamente confiável, Testes A/B podem comprovar o fenômeno aqui observado e indicar qual a 
 mecânica apropriada para cada SKU.
 
 
@@ -1033,7 +1030,7 @@ pague e leve, em comparação à ausência de cada mecânica e mantendo os demai
 fatores constantes. Esses percentuais são associações observadas, não prova de
 que as promoções causaram o aumento; além disso, não temos
 intervalos de confiança para esses efeitos promocionais.
-Para ingerências mais precisas, um teste controlado de mecânica promocional é mais recomendadao
+Para inferências mais precisas, um teste controlado de mecânica promocional é mais recomendado
 """
 
 #-------------------------------------------------------------------------------#
@@ -1075,12 +1072,12 @@ subir ou cair juntas; correlação negativa indica movimentos opostos. Isso não
 estabelece canibalização nem efeito de promoção, pois calendário e fatores
 comuns podem explicar a associação.
 De todo modo, no histórico avaliado:
-CAT_A_SUB1: SKU_08 e SKU_04 mostraram razoaveis movimentos opostos, um aprofundamento
+CAT_A_SUB1: SKU_08 e SKU_04 mostraram razoáveis movimentos opostos, um aprofundamento
 poderia validar possível efeito de canibalização, assim como observado em CAT_A_SUB2 
 para os SKUs 12 e 05
 Entre todas as Subcategorias, a CAT_A SUB3 foi a que mostrou mais indícios de possível canibalização
-para os SKUS 14 e 17 (R Pearson = -0.44). Analogamente, os SKUs 15 e 11 da CAT_C_SUB1 
-tiveram a maior correlação positiva (0,80). Possivelmente, SKUs de uso complementar pelo consumidor
+para os SKUs 14 e 17 (R Pearson = -0.44). Analogamente, os SKUs 15 e 11 da CAT_C_SUB1 
+tiveram a maior correlação positiva (0,80). Possivelmente, SKUs de uso complementar para o consumidor
 
 """
 # Aprofundamento para o par com maior indício no histórico (SKU 14 e SKU 17)
@@ -1155,9 +1152,9 @@ plt.tight_layout()
 save_show(fig, '17_canal_comparacao')
 
 """
-COMENTÁRIO: As estatística descritivas e a analise visual das distribuições de 
-Demanda, Descono e Preço Médio mostram que existe uma politica de preço rigorosa entre canais visto que
-a distribuição é quase idêntica. No período avaliado, a demanda semanal e levemente mais acentuada e com maior dispersão no canal Loja, 
+COMENTÁRIO: As estatísticas descritivas e a análise visual das distribuições de 
+Demanda, Desconto e Preço Médio mostram que existe uma política de preço rigorosa entre canais visto que
+a distribuição é quase idêntica. No período avaliado, a demanda semanal é levemente mais acentuada e com maior dispersão no canal Loja, 
 bem como a aplicação de Desconto. Talvez isso indique uma tentativa de atrair o cliente para a experiência de Loja e não só como uma venda transacional 
 OBS: Os pontos extremos foram ocultados para priorizar a distribuição central;
 isso não significa que tenham sido removidos dos dados.
@@ -1181,8 +1178,8 @@ ax.spines[['top', 'right']].set_visible(False)
 save_show(fig, '18_margem_por_sku')
 
 """
-COMENTÁRIO: De forma geral, a variação da margem para os SKUs e relativamente pequena, 
-o maior range foi SKU 04 com variação de 3,76 p.p, enquanto o SKU_02 com 1,4p.p foi o menor.
-Entretando, quando avaliamos a margem entre SKUs, o SKU 04 trabalha com margens entre 26 e 30%, a menor entre todos os 
-SKUs, bem distante da margem praticada pelo TOP SKU, SKU 01, e o SKU 11 com margens entre 57 e 61%.
+COMENTÁRIO: De forma geral, a variação da margem para os SKUs é relativamente pequena, 
+o maior range foi SKU 04 com variação de 3,76 p.p, enquanto o SKU_02 com 1,4 p.p foi o menor.
+Entretanto, quando avaliamos a margem entre SKUs, o SKU_04 trabalha com margens entre 26 e 30%, a menor entre todos os 
+SKUs, bem distante da margem praticada pelo TOP SKU, SKU_01, e o SKU_11, com margens entre 57 e 61%.
 """
