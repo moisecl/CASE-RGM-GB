@@ -24,7 +24,6 @@ FLAG_COLUMNS = [
     "flag_pague_e_leve",
 ]
 CATEGORY_COLUMNS = ["categoria_id", "subcategoria_id"]
-DATA_INICIO_MODELO = pd.Timestamp("2025-01-01")
 
 
 def carregar_dados_vendas() -> pd.DataFrame:
@@ -281,9 +280,6 @@ def preparar_dados_modelo(dados_brutos: pd.DataFrame) -> pd.DataFrame:
     Valida as colunas obrigatórias e as datas, aplica deduplicação e as regras
     causais de ``preparar_valores_ausentes_vendas``, e cria calendário e
     atributos históricos da quantidade vendida (lags e janelas móveis).
-    Descarta observações anteriores a 2025 antes de criar atributos temporais,
-    pois 2024 tem cobertura parcial e comportamento não comparável à série
-    observada de 2025 e 2026.
 
     Args:
         dados_brutos: Dados de vendas carregados do CSV.
@@ -318,13 +314,8 @@ def preparar_dados_modelo(dados_brutos: pd.DataFrame) -> pd.DataFrame:
             "Há datas inválidas na coluna 'semana'; "
             f"linhas do CSV (amostra): {rows}"
         )
-
-    df = df.loc[df["semana"] >= DATA_INICIO_MODELO].copy()
     if df.empty:
-        raise ValueError(
-            "Não há observações a partir de "
-            f"{DATA_INICIO_MODELO.date()} para preparar o modelo."
-        )
+        raise ValueError("Não há observações para preparar o modelo.")
 
     df = remover_duplicatas_vendas(df, ["sku_id", "canal", "semana"])
     # Ao contrário da EDA, o modelo não pode usar estatísticas de semanas futuras.

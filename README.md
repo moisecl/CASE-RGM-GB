@@ -83,9 +83,6 @@ defasagens de uma, duas, quatro e oito semanas, médias móveis de quatro e oito
 semanas e desvio-padrão móvel de quatro semanas. As estatísticas históricas são
 defasadas em uma semana para não incluir o resultado previsto.
 
-O modelo exclui datas anteriores a 2025-01-01 antes de criar os atributos
-temporais. O período de 2024 contém apenas onze semanas observadas e apresenta
-comportamento atípico em relação a 2025 e 2026.
 
 Cada previsão cobre oito semanas recursivamente: as previsões anteriores do
 próprio modelo são usadas para atualizar lags e médias móveis dentro do
@@ -128,7 +125,7 @@ O resultado apresenta WAPE, MAE e BIAS:
 As métricas são apresentadas para validação e teste; WAPE e MAE também são
 detalhadas por semana do horizonte. O console inclui ainda um exemplo de
 tradução do erro do SKU_01 por canal. A conversão para reais usa
-`|real - previsto| × preco_medio` como aproximação de valor bruto associado ao erro;
+`|real - previsto| × preco_medio` como proxy de valor bruto associado ao erro;
 não é uma estimativa de prejuízo, custo de estoque ou custo de ruptura.
 
 Para explicar previsões individuais, são salvos dois gráficos SHAP Waterfall:
@@ -223,3 +220,6 @@ corrige por uma ruptura futura ainda não informada.
   uma saída-base mais contribuições positivas e negativas das variáveis.
 - **NaN**: valor ausente. Os modelos de árvore usados aqui tratam valores
   numéricos ausentes diretamente.
+
+`best_hyperparameters` contém os parâmetros do estimador selecionado; não
+retorna parâmetros de uma configuração candidata que tenha perdido a seleção.

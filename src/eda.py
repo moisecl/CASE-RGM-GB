@@ -300,7 +300,10 @@ os demais no formato ISO (YYYY-MM-DD), será necessário ajuste
 """
 
 ## Passo 3: Trata casos identificados 
-df['semana_dt'] = pd.to_datetime(df['semana'], format='mixed', dayfirst=True, errors='coerce')
+semana = df['semana'].astype('string')
+semana_iso = pd.to_datetime(semana, format='%Y-%m-%d', errors='coerce')
+semana_br = pd.to_datetime(semana, format='%d/%m/%Y', errors='coerce')
+df['semana_dt'] = semana_iso.fillna(semana_br)
 df['semana'] = df['semana_dt']
 
 n_falhas = df['semana_dt'].isna().sum()
@@ -314,8 +317,7 @@ print(f'Nº de semanas ISO distintas: {df["semana_dt"].dt.to_period("W").nunique
 
 """
 COMENTÁRIOS
-- Após o parsing, o intervalo temporal vai de Fevereiro de 2024 a Dezembro de 2026, 
-cobrindo 94 semanas distintas.
+Após o parsing, o intervalo temporal vai de Outubro de 2024 a Outubro de 2026
 
 """
 
@@ -831,14 +833,6 @@ skus = sorted(demanda_sku_semana['sku_id'].unique())
 fig, axes = plt.subplots(nrows=4, ncols=5, figsize=(20, 12), sharex=False)
 for ax, sku in zip(axes.flat, skus):
     d = demanda_sku_semana[demanda_sku_semana['sku_id'] == sku]
-    ax.axvspan(
-        pd.Timestamp('2024-01-01'),
-        pd.Timestamp('2025-01-01'),
-        color='#d5a64a',
-        alpha=0.12,
-        zorder=0,
-    )
-    ax.axvline(pd.Timestamp('2025-01-01'), color='#8c5c3f', linewidth=0.8)
     sns.lineplot(data=d, x='semana_dt', y='demanda_real',
                  ax=ax, color='#3f7180', linewidth=1.4)
     ax.set_title(sku, fontsize=10)
@@ -857,15 +851,6 @@ save_show(fig, '10_demanda_por_sku')
 COMENTÁRIO: Destaques observados: 
 - SKU_03 e SKU_15 apresentam tendência de crescimento de demanda,
 - SKU_02 e SKU_13 aparentam ser lançamentos dado o horizonte temporal de vendas
-- A demanda de 2024 para todos os SKUs com vendas nesse período apresenta comportamento atípico 
-vs 2025 e 2026
-
-Obs: 2024 contém somente 11 semanas observadas,
-enquanto 2025 tem 52 e 2026 tem 43. Além da cobertura parcial, a média e a
-dispersão da demanda de 2024 diferem das observadas em 2025 e 2026. A janela não é
-comparável e pode distorcer o aprendizado temporal; por isso, 2024 será removido
-antes da criação de lags e demais atributos do modelo preditivo. O sombreado
-destaca essa janela; a linha vertical marca o início do período utilizado.
 """
 
 #-------------------------------------------------------------------------------#
@@ -1017,15 +1002,15 @@ print(
 print(f'\nTabela detalhada salva em: {arquivo_elasticidade}')
 
 """
-COMENTÁRIO: Para o SKU_01, a elasticidade-preço estimada é -0,19: na amostra,
-um aumento de 1% no preço está associado a uma redução aproximada de 0,19% na
+COMENTÁRIO: Para o SKU_01, a elasticidade-preço estimada é -0,11: na amostra,
+um aumento de 1% no preço está associado a uma redução aproximada de 0,11% na
 quantidade vendida, mantendo os demais fatores do modelo constantes. Porém, o
-intervalo de confiança de 95% vai de -0,96 a +0,53 e inclui zero; portanto, os
+intervalo de confiança de 95% vai de -0,78 a +0,55 e inclui zero; portanto, os
 dados não permitem afirmar com clareza que exista uma relação entre preço e
 vendas para esse SKU.
 
-As flags promocionais do SKU_01 aparecem associadas a vendas cerca de 10,4%
-maiores com desconto direto, 28,5% maiores com combo e 21,9% maiores com
+As flags promocionais do SKU_01 aparecem associadas a vendas cerca de 6,49%
+maiores com desconto direto, 23,05% maiores com combo e 32,6% maiores com
 pague e leve, em comparação à ausência de cada mecânica e mantendo os demais
 fatores constantes. Esses percentuais são associações observadas, não prova de
 que as promoções causaram o aumento; além disso, não temos
