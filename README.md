@@ -8,7 +8,7 @@ investiga sazonalidade, rupturas, promoções, elasticidade-preço e relações 
 SKUs. A modelagem usa validação temporal, previsão recursiva e uma faixa
 quantílica para comunicar a incerteza das previsões.
 
-O alvo do modelo é `qt_vendida, vendas observadas, e não a demanda estimada
+O alvo do modelo é `qt_vendida`, vendas observadas, e não a demanda estimada
 somando vendas e ruptura. Como o arquivo não informa planos futuros de preço,
 promoção ou ruptura, essas variáveis não são usadas como entradas da previsão.
 
