@@ -8,7 +8,7 @@ investiga sazonalidade, rupturas, promoções, elasticidade-preço e relações 
 SKUs. A modelagem usa validação temporal, previsão recursiva e uma faixa
 quantílica para comunicar a incerteza das previsões.
 
-O alvo do modelo é `qt_vendida` — vendas observadas — e não a demanda estimada
+O alvo do modelo é `qt_vendida, vendas observadas, e não a demanda estimada
 somando vendas e ruptura. Como o arquivo não informa planos futuros de preço,
 promoção ou ruptura, essas variáveis não são usadas como entradas da previsão.
 
@@ -171,28 +171,6 @@ SHAP descreve como o modelo chegou à saída para aquelas entradas; não demonst
 causalidade. Se a saída bruta do modelo for negativa, o gráfico explica essa
 saída antes do limite mínimo aplicado para apresentar previsões não negativas.
 
-### Regressão quantílica e faixa de previsão
-
-A antiga margem de erro absoluto agrupada por porte da previsão foi substituída
-por regressão quantílica condicional. Após a seleção do modelo-base, ajustam-se
-modelos para P05, P50 e P95. Para cada SKU, canal e semana do
-horizonte, o resultado inclui `previsao_p05`, `previsao` (P50) e
-`previsao_p95`; o gráfico sombreia diretamente P05–P95. A largura percentual é
-`(previsao_p95 - previsao_p05) / previsao × 100` e não é calculada quando P50
-é zero.
-
-Os modelos quantílicos são avaliados nas mesmas origens temporais OOF do
-modelo-base, sem usar vendas reais das semanas previstas para atualizar o
-histórico. As métricas por horizonte incluem o *pinball loss* para cada
-quantil, a proporção de valores reais abaixo de cada previsão quantílica, a
-cobertura observada entre P05 e P95 e a largura média do intervalo. P05–P95
-corresponde a 90% de cobertura nominal; a cobertura observada pode variar e
-não é garantida.
-
-A tabela de previsão e o retorno de `run_model` não usam mais as colunas de
-margem agrupadas por porte ou limites inferior/superior derivados dessa margem;
-os limites são as próprias previsões quantílicas P05 e P95.
-
 ## Preparação dos dados
 
 Linhas exatamente duplicadas são removidas. Para registros diferentes com a
@@ -253,6 +231,3 @@ corrige por uma ruptura futura ainda não informada.
   uma saída-base mais contribuições positivas e negativas das variáveis.
 - **NaN**: valor ausente. Os modelos de árvore usados aqui tratam valores
   numéricos ausentes diretamente.
-
-`best_hyperparameters` contém os parâmetros do estimador selecionado; não
-retorna parâmetros de uma configuração candidata que tenha perdido a seleção.
