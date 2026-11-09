@@ -120,8 +120,6 @@ O resultado apresenta WAPE, MAE e BIAS:
   absolutas. Resume o erro relativo agregado; menor é melhor.
 - **MAE**: média dos erros absolutos, em unidades vendidas. Indica o tamanho
   típico do erro; menor é melhor.
-- **Pinball loss**: função de erro assimétrica que avalia cada previsão
-  quantílica; menor é melhor e cada quantil é avaliado separadamente.
 - **BIAS**: erro médio (previsto menos real) dividido pela média real. Valor
   positivo indica tendência a superestimar; negativo, a subestimar; zero indica
   ausência de viés médio. Valores positivos e negativos podem se compensar.
@@ -147,6 +145,9 @@ efetivamente observada pode diferir. A validação OOF e o teste reportam
 intervalo P05–P95 e largura média, também detalhadas por semana do horizonte.
 Esses diagnósticos medem o desempenho nas amostras avaliadas; não são garantia
 de cobertura futura nem intervalo de confiança.
+
+- **Pinball loss**: função de erro assimétrica que avalia cada previsão
+  quantílica; menor é melhor e cada quantil é avaliado separadamente.
 
 No resultado de `run_model`, `quantile_models` contém os três pipelines finais,
 `quantile_validation_predictions` contém as previsões OOF e `metrics` inclui
