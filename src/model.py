@@ -11,12 +11,11 @@ anterior às oito semanas finais e avaliado nessas semanas, também de forma
 recursiva. Assim, o teste representa uma única previsão de oito semanas, e não
 oito previsões semanais atualizadas com vendas reais.
 
-A confiabilidade é resumida por faixas de porte da previsão (<50, 50–150 e
->150 unidades) e por semana do horizonte. Para cada combinação, calcula-se o
-percentil 90 dos erros absolutos das previsões OOF de validação; esse valor
-forma uma margem empírica acima e abaixo da previsão. As faixas refletem erros
-observados em validação e não são garantias de que o valor real ficará dentro
-delas.
+A incerteza é estimada por regressão quantílica condicional, aplicada somente
+depois da seleção do melhor modelo-base. Três modelos são ajustados para os
+quantis 0.05, 0.50 e 0.95, gerando previsões P05, P50 e P95. A mediana é
+realimentada no histórico durante a previsão recursiva. A cobertura observada
+na validação é reportada como diagnóstico, não como garantia.
 
 Gráficos SHAP Waterfall explicam contribuições locais para uma previsão de
 SKU_01 na primeira semana do teste, em cada canal. As contribuições das
@@ -43,7 +42,7 @@ import shap
 from lightgbm import LGBMRegressor
 from sklearn.base import BaseEstimator, clone
 from sklearn.compose import ColumnTransformer
-from sklearn.metrics import mean_absolute_error
+from sklearn.metrics import mean_absolute_error, mean_pinball_loss
 from sklearn.model_selection import ParameterSampler
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
@@ -72,8 +71,7 @@ TEST_WEEKS = 8
 MIN_TRAIN_WEEKS = 8
 RANDOM_STATE = 42
 RANDOM_SEARCH_ITERATIONS = 12
-PREDICTION_BUCKETS = ("<50", "50-150", ">150")
-ERROR_QUANTILE = 0.90
+PREDICTION_QUANTILES = (0.05, 0.50, 0.95)
 MODEL_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "outputs" / "model"
 
 NUMERIC_FEATURES = [
@@ -297,10 +295,10 @@ def _save_test_forecast_charts(predictions: pd.DataFrame) -> dict[str, Path]:
             )
             axis.fill_between(
                 group["semana"],
-                group["previsao_inferior"],
-                group["previsao_superior"],
+                group["previsao_p05"],
+                group["previsao_p95"],
                 alpha=0.15,
-                label="Faixa estimada (P90)",
+                label="Intervalo quantílico P05–P95",
             )
             axis.set_title(str(sku))
             axis.grid(alpha=0.25)
@@ -467,6 +465,181 @@ def _forecast_recursively(
     return forecast, forecast_features
 
 
+def _make_quantile_estimators(
+    model_name: str, estimator: BaseEstimator
+) -> dict[float, BaseEstimator]:
+    """Cria um estimador por quantil mantendo a configuração selecionada."""
+    objective_parameters = {
+        "LightGBM": ("quantile", "alpha"),
+        "XGBoost": ("reg:quantileerror", "quantile_alpha"),
+    }
+    if model_name not in objective_parameters:
+        raise ValueError(f"Regressão quantílica não configurada para {model_name}.")
+
+    objective, quantile_parameter = objective_parameters[model_name]
+    return {
+        quantile: clone(estimator).set_params(
+            objective=objective, **{quantile_parameter: quantile}
+        )
+        for quantile in PREDICTION_QUANTILES
+    }
+
+
+def _forecast_recursively_quantiles(
+    pipelines: dict[float, Pipeline],
+    history: pd.DataFrame,
+    forecast_rows: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Prevê os quantis recursivamente, usando P50 como histórico futuro."""
+    forecast_weeks = pd.Index(
+        forecast_rows["semana"].drop_duplicates().sort_values()
+    )
+    if len(forecast_weeks) != FORECAST_HORIZON_WEEKS:
+        raise ValueError(
+            "A previsão recursiva deve conter exatamente "
+            f"{FORECAST_HORIZON_WEEKS} semanas."
+        )
+    if not (
+        forecast_weeks.to_series().diff().dropna().dt.days.eq(7).all()
+    ):
+        raise ValueError("O horizonte de previsão deve conter semanas contíguas.")
+    if set(pipelines) != set(PREDICTION_QUANTILES):
+        raise ValueError("É necessário fornecer os três modelos quantílicos.")
+
+    working_history = history[["sku_id", "canal", "semana", TARGET]].copy()
+    results = []
+    feature_rows = []
+    for horizon, week in enumerate(forecast_weeks, 1):
+        week_rows = forecast_rows.loc[forecast_rows["semana"] == week].copy()
+        week_features = preparar_features_semana(working_history, week_rows)
+        features = week_features[FEATURES]
+        feature_rows.append(features.copy())
+        quantile_predictions = np.column_stack(
+            [
+                pipelines[quantile].predict(features)
+                for quantile in PREDICTION_QUANTILES
+            ]
+        )
+        quantile_predictions = np.sort(
+            np.clip(quantile_predictions, 0, None), axis=1
+        )
+
+        result_columns = ["semana", "sku_id", "canal"]
+        if TARGET in week_rows:
+            result_columns.append(TARGET)
+        if "preco_medio" in week_rows:
+            result_columns.append("preco_medio")
+        week_result = week_rows[result_columns].copy()
+        week_result["previsao_p05"] = quantile_predictions[:, 0]
+        week_result["previsao"] = quantile_predictions[:, 1]
+        week_result["previsao_p95"] = quantile_predictions[:, 2]
+        week_result["largura_faixa_pct"] = np.nan
+        positive_predictions = week_result["previsao"] > 0
+        week_result.loc[positive_predictions, "largura_faixa_pct"] = (
+            (
+                week_result.loc[positive_predictions, "previsao_p95"]
+                - week_result.loc[positive_predictions, "previsao_p05"]
+            )
+            / week_result.loc[positive_predictions, "previsao"]
+            * 100
+        )
+        week_result["horizonte"] = horizon
+        results.append(week_result)
+
+        predicted_history = week_rows[["sku_id", "canal", "semana"]].copy()
+        predicted_history[TARGET] = week_result["previsao"].to_numpy()
+        working_history = pd.concat(
+            [working_history, predicted_history], ignore_index=True
+        )
+
+    forecast = pd.concat(results).sort_values(["semana", "sku_id", "canal"])
+    forecast_features = pd.concat(feature_rows).loc[forecast.index]
+    return forecast, forecast_features
+
+
+def _evaluate_recursive_quantiles(
+    model_name: str,
+    estimator: BaseEstimator,
+    frame: pd.DataFrame,
+    features: pd.DataFrame,
+    target: pd.Series,
+    folds: list[tuple[np.ndarray, pd.Index]],
+) -> pd.DataFrame:
+    """Avalia os quantis em folds temporais após selecionar o modelo-base."""
+    validation_predictions = []
+    for train_indices, validation_weeks in folds:
+        x_train = features.iloc[train_indices]
+        y_train = target.iloc[train_indices]
+        history = frame.iloc[train_indices]
+        forecast_rows = frame.loc[frame["semana"].isin(validation_weeks)]
+        if x_train.empty or forecast_rows.empty:
+            raise ValueError("Fold temporal sem linhas de treino ou validação.")
+
+        quantile_pipelines = {
+            quantile: _make_pipeline(quantile_estimator)
+            for quantile, quantile_estimator in _make_quantile_estimators(
+                model_name, estimator
+            ).items()
+        }
+        for pipeline in quantile_pipelines.values():
+            pipeline.fit(x_train, y_train)
+        predictions, _ = _forecast_recursively_quantiles(
+            quantile_pipelines, history, forecast_rows
+        )
+        validation_predictions.append(predictions)
+    return pd.concat(validation_predictions).sort_index()
+
+
+def _quantile_metrics(
+    actual: pd.Series, predictions: pd.DataFrame
+) -> dict[str, object]:
+    """Calcula pinball loss, cobertura por quantil e cobertura do intervalo."""
+    quantile_columns = {
+        0.05: "previsao_p05",
+        0.50: "previsao",
+        0.95: "previsao_p95",
+    }
+    return {
+        "pinball_loss": {
+            quantile: float(
+                mean_pinball_loss(
+                    actual,
+                    predictions[column],
+                    alpha=quantile,
+                )
+            )
+            for quantile, column in quantile_columns.items()
+        },
+        "cobertura_por_quantil": {
+            quantile: float(
+                (actual.to_numpy() <= predictions[column].to_numpy()).mean()
+            )
+            for quantile, column in quantile_columns.items()
+        },
+        "cobertura_intervalo_p05_p95": float(
+            (
+                actual.ge(predictions["previsao_p05"])
+                & actual.le(predictions["previsao_p95"])
+            ).mean()
+        ),
+        "largura_media_intervalo": float(
+            (
+                predictions["previsao_p95"]
+                - predictions["previsao_p05"]
+            ).mean()
+        ),
+    }
+
+
+def _quantile_metrics_by_horizon(
+    predictions: pd.DataFrame,
+) -> dict[int, dict[str, object]]:
+    return {
+        int(horizon): _quantile_metrics(group[TARGET], group)
+        for horizon, group in predictions.groupby("horizonte", sort=True)
+    }
+
+
 def _evaluate_recursive_model(
     estimator: BaseEstimator,
     frame: pd.DataFrame,
@@ -520,79 +693,6 @@ def _evaluate_recursive_model(
         cross_validation_scores,
         oof_predictions,
     )
-
-
-def _prediction_buckets(predictions: pd.Series) -> pd.Series:
-    """Classifica previsões nas faixas de volume usadas na calibração."""
-    values = predictions.to_numpy()
-    if not np.isfinite(values).all():
-        raise ValueError("As previsões devem ser finitas para calcular a faixa.")
-
-    return pd.Series(
-        np.select(
-            [values < 50, values <= 150],
-            [PREDICTION_BUCKETS[0], PREDICTION_BUCKETS[1]],
-            default=PREDICTION_BUCKETS[2],
-        ),
-        index=predictions.index,
-        name="faixa_previsao",
-    )
-
-
-def _oof_error_by_bucket(oof_predictions: pd.DataFrame) -> pd.DataFrame:
-    """Calcula o erro P90 por semana do horizonte e porte da previsão."""
-    buckets = _prediction_buckets(oof_predictions["previsao"])
-    absolute_errors = (
-        oof_predictions[TARGET] - oof_predictions["previsao"]
-    ).abs()
-    summary = []
-    for horizon in range(1, FORECAST_HORIZON_WEEKS + 1):
-        for bucket in PREDICTION_BUCKETS:
-            mask = oof_predictions["horizonte"].eq(horizon) & buckets.eq(bucket)
-            errors = absolute_errors.loc[mask]
-            summary.append(
-                {
-                    "horizonte": horizon,
-                    "faixa_previsao": bucket,
-                    "quantidade_oof": len(errors),
-                    "erro_p90_unidades": (
-                        float(errors.quantile(ERROR_QUANTILE))
-                        if not errors.empty
-                        else float("nan")
-                    ),
-                }
-            )
-    return pd.DataFrame(summary).set_index(["horizonte", "faixa_previsao"])
-
-
-def _add_prediction_intervals(
-    predictions: pd.DataFrame, error_by_bucket: pd.DataFrame
-) -> pd.DataFrame:
-    """Anexa faixa P90 calibrada por horizonte e porte da previsão."""
-    result = predictions.copy()
-    prediction_buckets = _prediction_buckets(result["previsao"])
-    calibration_keys = pd.MultiIndex.from_arrays(
-        [result["horizonte"], prediction_buckets],
-        names=["horizonte", "faixa_previsao"],
-    )
-    result["erro_p90_unidades"] = error_by_bucket[
-        "erro_p90_unidades"
-    ].reindex(calibration_keys).to_numpy()
-    result["previsao_inferior"] = (
-        result["previsao"] - result["erro_p90_unidades"]
-    ).clip(lower=0)
-    result["previsao_superior"] = (
-        result["previsao"] + result["erro_p90_unidades"]
-    )
-    result["largura_faixa_pct"] = np.nan
-    positive_predictions = result["previsao"] > 0
-    result.loc[positive_predictions, "largura_faixa_pct"] = (
-        2
-        * result.loc[positive_predictions, "erro_p90_unidades"]
-        / result.loc[positive_predictions, "previsao"]
-        * 100
-    )
-    return result
 
 
 def _random_search_best_model(
@@ -876,24 +976,49 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         if selected_name == tuned_name
         else candidates[initial_winner]
     )
-    selected_pipeline = _make_pipeline(clone(selected_estimator))
-    _, selected_cv_scores, oof_predictions = (
+    _, selected_cv_scores, _ = (
         recursive_evaluations[selected_name]
     )
-    error_by_bucket = _oof_error_by_bucket(oof_predictions)
     print(
-        f"\nErro absoluto P{ERROR_QUANTILE:.0%} por semana do horizonte e "
-        f"faixa de previsão (unidades):\n"
-        + error_by_bucket.to_string(
-            formatters={
-                "erro_p90_unidades": lambda value: f"{value:.2f}"
-            }
-        )
+        "\nAplicando regressão quantílica ao modelo-base já selecionado "
+        f"({selected_name}); quantis: {PREDICTION_QUANTILES}."
+    )
+    quantile_oof_predictions = _evaluate_recursive_quantiles(
+        initial_winner,
+        selected_estimator,
+        pre_test,
+        features,
+        target,
+        folds,
+    )
+    quantile_cv_scores = _quantile_metrics(
+        quantile_oof_predictions[TARGET], quantile_oof_predictions
+    )
+    quantile_cv_scores["por_horizonte"] = _quantile_metrics_by_horizon(
+        quantile_oof_predictions
+    )
+    print(
+        "Validação quantílica OOF | "
+        f"pinball P05 {quantile_cv_scores['pinball_loss'][0.05]:.2f}; "
+        f"P50 {quantile_cv_scores['pinball_loss'][0.50]:.2f}; "
+        f"P95 {quantile_cv_scores['pinball_loss'][0.95]:.2f} | "
+        f"cobertura P05–P95 "
+        f"{quantile_cv_scores['cobertura_intervalo_p05_p95']:.1%} "
+        f"(largura média "
+        f"{quantile_cv_scores['largura_media_intervalo']:.2f} un.)"
     )
 
     # Ajusta novamente somente com dados anteriores ao teste; as semanas finais
     # não podem participar nem do ajuste nem da escolha dos parâmetros.
-    selected_pipeline.fit(pre_test[FEATURES], pre_test[TARGET])
+    quantile_pipelines = {
+        quantile: _make_pipeline(quantile_estimator)
+        for quantile, quantile_estimator in _make_quantile_estimators(
+            initial_winner, selected_estimator
+        ).items()
+    }
+    for pipeline in quantile_pipelines.values():
+        pipeline.fit(pre_test[FEATURES], pre_test[TARGET])
+    selected_pipeline = quantile_pipelines[0.50]
     train_prediction = np.clip(
         selected_pipeline.predict(pre_test[FEATURES]), 0, None
     )
@@ -901,12 +1026,11 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         pre_test[TARGET], train_prediction
     )
 
-    predictions, prediction_features = _forecast_recursively(
-        selected_pipeline,
+    predictions, prediction_features = _forecast_recursively_quantiles(
+        quantile_pipelines,
         pre_test[["sku_id", "canal", "semana", TARGET]],
         test,
     )
-    predictions = _add_prediction_intervals(predictions, error_by_bucket)
 
     test_scores = _metrics(
         test[TARGET],
@@ -918,6 +1042,12 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         )
         for horizon, group in predictions.groupby("horizonte", sort=True)
     }
+    quantile_test_scores = _quantile_metrics(
+        predictions[TARGET], predictions
+    )
+    quantile_test_scores["por_horizonte"] = _quantile_metrics_by_horizon(
+        predictions
+    )
     chart_paths = _save_test_forecast_charts(predictions)
     shap_explainer = shap.TreeExplainer(
         selected_pipeline.named_steps["model"]
@@ -959,6 +1089,12 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         f"| Erro médio (MAE): {test_scores['mae']:.2f} unidades "
         f"| Tendência a super/subestimar (BIAS): {test_scores['bias']:.2%}"
     )
+    print(
+        "Cobertura observada do intervalo P05–P95 no teste: "
+        f"{quantile_test_scores['cobertura_intervalo_p05_p95']:.1%} "
+        f"| largura média: "
+        f"{quantile_test_scores['largura_media_intervalo']:.2f} unidades"
+    )
     print("Gráficos SHAP Waterfall (explicação de SKU_01 na semana 1 do teste):")
     for channel, chart_path in shap_chart_paths.items():
         print(f"  {channel}: {chart_path}")
@@ -978,9 +1114,8 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         "horizonte",
         TARGET,
         "previsao",
-        "erro_p90_unidades",
-        "previsao_inferior",
-        "previsao_superior",
+        "previsao_p05",
+        "previsao_p95",
         "largura_faixa_pct",
     ]
     print("\nExemplos de previsões no teste:")
@@ -993,13 +1128,16 @@ def run_model(df: pd.DataFrame) -> dict[str, object]:
         "metrics": {
             "train_one_step_reference": train_one_step_scores,
             "cross_validation": selected_cv_scores,
+            "quantile_cross_validation": quantile_cv_scores,
             "test": test_scores,
+            "quantile_test": quantile_test_scores,
             **test_scores,
         },
         "model_comparison": model_results,
         "best_hyperparameters": selected_parameters,
+        "quantile_models": quantile_pipelines,
+        "quantile_validation_predictions": quantile_oof_predictions,
         "shap_waterfall_charts": shap_chart_paths,
-        "erro_oof_por_horizonte_e_faixa": error_by_bucket,
         "feature_descriptions": FEATURE_DESCRIPTIONS,
         "periods": {
             "cross_validation": _period_description(

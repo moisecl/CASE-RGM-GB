@@ -6,7 +6,7 @@ Este projeto analisa vendas semanais por SKU e canal e compara modelos para
 prever a quantidade vendida nas oito semanas seguintes. A análise exploratória
 investiga sazonalidade, rupturas, promoções, elasticidade-preço e relações entre
 SKUs. A modelagem usa validação temporal, previsão recursiva e uma faixa
-empírica de erro para comunicar a incerteza das previsões.
+quantílica para comunicar a incerteza das previsões.
 
 O alvo do modelo é `qt_vendida` — vendas observadas — e não a demanda estimada
 somando vendas e ruptura. Como o arquivo não informa planos futuros de preço,
@@ -18,8 +18,10 @@ promoção ou ruptura, essas variáveis não são usadas como entradas da previs
   canal e semana.
 - `src/data_utils.py`: carregamento, deduplicação e preparação compartilhada.
 - `src/eda.py`: análise exploratória, gráficos e estimativa de elasticidade.
-- `src/model.py`: treinamento, avaliação, interpretação global e gráficos de
-  previsão.
+- `src/model.py`: treinamento, avaliação, explicações SHAP locais e gráficos
+  de previsão; este é o workflow recomendado para execução.
+- `src/model_quantile.py`: script independente que também executa o workflow
+  quantílico.
 - `outputs/eda/`: gráficos e tabela de elasticidade gerados pela EDA.
 - `outputs/model/`: gráficos de vendas reais e previstas e explicações SHAP.
 
@@ -118,6 +120,8 @@ O resultado apresenta WAPE, MAE e BIAS:
   absolutas. Resume o erro relativo agregado; menor é melhor.
 - **MAE**: média dos erros absolutos, em unidades vendidas. Indica o tamanho
   típico do erro; menor é melhor.
+- **Pinball loss**: função de erro assimétrica que avalia cada previsão
+  quantílica; menor é melhor e cada quantil é avaliado separadamente.
 - **BIAS**: erro médio (previsto menos real) dividido pela média real. Valor
   positivo indica tendência a superestimar; negativo, a subestimar; zero indica
   ausência de viés médio. Valores positivos e negativos podem se compensar.
@@ -127,6 +131,30 @@ detalhadas por semana do horizonte. O console inclui ainda um exemplo de
 tradução do erro do SKU_01 por canal. A conversão para reais usa
 `|real - previsto| × preco_medio` como proxy de valor bruto associado ao erro;
 não é uma estimativa de prejuízo, custo de estoque ou custo de ruptura.
+
+Depois que o melhor modelo-base é selecionado pela WAPE/MAE da validação, o
+estimador escolhido (LightGBM ou XGBoost, com seus parâmetros selecionados) é
+ajustado separadamente para os quantis 0,05, 0,50 e 0,95. Essa etapa não altera
+a escolha do modelo-base. A previsão pontual `previsao` é P50; `previsao_p05` e
+`previsao_p95` delimitam o intervalo quantílico exibido nos gráficos. Como os
+quantis são ordenados após limitar valores negativos a zero, as três saídas
+permanecem não negativas e sem cruzamento. P50 é realimentado no histórico para
+as semanas seguintes da previsão recursiva.
+
+O intervalo P05–P95 tem cobertura nominal de 90% (0,95 − 0,05); a cobertura
+efetivamente observada pode diferir. A validação OOF e o teste reportam
+*pinball loss* de cada quantil, cobertura observada por quantil, cobertura do
+intervalo P05–P95 e largura média, também detalhadas por semana do horizonte.
+Esses diagnósticos medem o desempenho nas amostras avaliadas; não são garantia
+de cobertura futura nem intervalo de confiança.
+
+No resultado de `run_model`, `quantile_models` contém os três pipelines finais,
+`quantile_validation_predictions` contém as previsões OOF e `metrics` inclui
+`quantile_cross_validation` e `quantile_test`. Em cada previsão,
+`largura_faixa_pct` é a largura P95–P05 como percentual de P50; fica indefinida
+se P50 for zero.
+O retorno `model` também corresponde ao pipeline P50; `best_hyperparameters`
+registra os parâmetros do modelo-base selecionado.
 
 Para explicar previsões individuais, são salvos dois gráficos SHAP Waterfall:
 um para SKU_01 na primeira semana do teste em cada canal
@@ -143,24 +171,27 @@ SHAP descreve como o modelo chegou à saída para aquelas entradas; não demonst
 causalidade. Se a saída bruta do modelo for negativa, o gráfico explica essa
 saída antes do limite mínimo aplicado para apresentar previsões não negativas.
 
-### Faixa empírica de erro
+### Regressão quantílica e faixa de previsão
 
-Para comunicar a variabilidade das previsões, o erro absoluto do percentil 90
-(P90) é calculado a partir das previsões fora da amostra (*out-of-fold*, OOF)
-da validação, por semana do horizonte e faixa de volume previsto: menos de 50,
-de 50 a 150 e mais de 150 unidades. P90 é o valor em que 90% dos erros
-observados ficaram abaixo ou iguais nas simulações usadas para a calibração.
+A antiga margem de erro absoluto agrupada por porte da previsão foi substituída
+por regressão quantílica condicional. Após a seleção do modelo-base, ajustam-se
+modelos para P05, P50 e P95. Para cada SKU, canal e semana do
+horizonte, o resultado inclui `previsao_p05`, `previsao` (P50) e
+`previsao_p95`; o gráfico sombreia diretamente P05–P95. A largura percentual é
+`(previsao_p95 - previsao_p05) / previsao × 100` e não é calculada quando P50
+é zero.
 
-Por exemplo, se a previsão for 100 unidades e o erro P90 correspondente for
-20, a faixa exibida será de 80 a 120 (`previsao_inferior` e
-`previsao_superior`). O limite inferior é truncado em zero. `largura_faixa_pct`
-expressa a largura total como percentual da previsão e não é calculada quando
-a previsão é zero.
+Os modelos quantílicos são avaliados nas mesmas origens temporais OOF do
+modelo-base, sem usar vendas reais das semanas previstas para atualizar o
+histórico. As métricas por horizonte incluem o *pinball loss* para cada
+quantil, a proporção de valores reais abaixo de cada previsão quantílica, a
+cobertura observada entre P05 e P95 e a largura média do intervalo. P05–P95
+corresponde a 90% de cobertura nominal; a cobertura observada pode variar e
+não é garantida.
 
-A tabela `erro_oof_por_horizonte_e_faixa` contém o erro P90 e a quantidade de
-observações de cada combinação. Se não houver observações para uma combinação,
-o erro fica indefinido; não é substituído pelo de outra faixa. Essas faixas são
-referências empíricas, não garantias de cobertura nem intervalos de confiança.
+A tabela de previsão e o retorno de `run_model` não usam mais as colunas de
+margem agrupadas por porte ou limites inferior/superior derivados dessa margem;
+os limites são as próprias previsões quantílicas P05 e P95.
 
 ## Preparação dos dados
 
@@ -214,6 +245,8 @@ corrige por uma ruptura futura ainda não informada.
   semanas e treina apenas com o passado.
 - **OOF (out-of-fold)**: previsões feitas em blocos de validação que não foram
   usados para ajustar o modelo daquela rodada.
+- **P05/P50/P95**: quantis condicionais 0,05, 0,50 (mediana) e 0,95 da
+  distribuição prevista; P05–P95 tem cobertura nominal de 90%.
 - **Bootstrap**: reamostragem de semanas para estimar a variabilidade da
   elasticidade.
 - **SHAP Waterfall**: gráfico de explicação local que decompõe uma previsão em
